@@ -1,0 +1,9 @@
+data/org.db*
+data/annotations.db
+data/inbox
+data/sources
+data/synthetic
+data/rules.json
+tests
+**/__pycache__
+data/ad_state.json

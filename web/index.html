@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ORGX directory</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231c1d1f'/%3E%3Cpath d='M4 5h8M4 8h8M4 11h5' stroke='white' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preload" href="/fonts/public-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/public-sans-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/IBMPlexSansCondensed-SemiBold-Latin1.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/css/app.css">
+  <script>
+    try { const t = JSON.parse(localStorage.getItem("orgx.settings") || "{}").theme; document.documentElement.dataset.theme = t || "dark"; } catch (e) {}
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="head">
+      <a class="wordmark" href="#/home" title="ORGX directory">ORGX</a>
+      <nav class="tabs-nav" id="nav" aria-label="Views"></nav>
+      <div class="search" id="omni">
+        <input id="omni-input" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search people, offices, bases" aria-label="Search people, offices and bases, or ask who handles something">
+        <kbd>Ctrl K</kbd>
+        <div class="omni-pop hidden" id="omni-pop" role="listbox"></div>
+      </div>
+      <button class="clockbtn" id="clocks" aria-haspopup="menu" aria-label="Clocks"></button>
+      <div class="me" id="me"></div>
+    </header>
+    <div id="notice"></div>
+    <main id="view" class="view"></main>
+  </div>
+  <aside class="drawer" id="drawer" aria-label="Record" hidden></aside>
+  <div class="statusbar" id="status" role="status" aria-live="polite"></div>
+  <div id="modal-root"></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

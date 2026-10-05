@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local config
+.env
+*.local
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime data: directory DB, team notes, uploaded and generated exports
+data/org.db*
+data/annotations.db
+data/rules.json
+data/inbox/
+data/sources/
+data/synthetic/
+data/ad_state.json
+data/sites.json
+data/bases.json

@@ -1,0 +1,15 @@
+services:
+  orgx:
+    build: .
+    container_name: orgx
+    ports:
+      - "48750:48750"
+    volumes:
+      # org.db, annotations.db (team notes & groups), rules.json, sites.json (optional),
+      # inbox/ (drop exports here) and sources/ (archived exports) all live here
+      - ./data:/data
+    environment:
+      ORGX_INBOX_SECONDS: "20"   # 0 disables the inbox watcher
+      ORGX_UPLOAD: "1"           # 0 disables browser uploads (inbox / CLI only)
+      ORGX_DEMO: "0"             # 1 = seed synthetic data on first start
+    restart: unless-stopped

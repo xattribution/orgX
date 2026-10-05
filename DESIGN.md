@@ -8,7 +8,7 @@ Every visual element in `web/` should trace to a line in section 4. If it doesn'
   footprint. Many lookups a day, each a few seconds long, usually in the middle of writing an
   email, building a distro or setting up a call.
 - **What it replaces**: the Outlook global address list. That means an alphabetical list of
-  `SMITH, JOHN A CIV USAF ACC/A3O` strings, a properties dialog with tabs, and no idea who
+  `SMITH, JOHN A CIV USAF HARBOR/A3O` strings, a properties dialog with tabs, and no idea who
   actually handles what. The job is to make that lookup faster and more pleasant, not to
   reproduce it.
 - **Where**: NIPR desktops in bright offices, 1080p to 1440p, Edge or Chrome. Sometimes a
@@ -122,4 +122,6 @@ lives under Data, out of the way.
 | Dark theme default, light available | Long sessions at a desk; light for bright offices | Setting |
 | Short status line at the bottom when something happens ("Copied DSN 315-…") | Confirmation of an invisible action | Feedback without dialogs |
 | (i) tips | The few terms that need explaining | No explainer text printed on pages |
+| On-the-fly results fill in place, with no spinner | Records that arrived from AD after the first draw | Lookups take well under a second; a loader would flash |
+| AD settings show only the current mode's fields | Export settings or lookup settings, never both | No disabled or irrelevant controls |
 | Dashed outline on map markers | Approximate placement | Position confidence, shown without color |

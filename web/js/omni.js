@@ -1,6 +1,6 @@
 /* Search box: jump to a person, office or base — or ask who the POC is for something. */
 import { $, esc, attr, debounce, dirName, kindShort, plainName } from "./ui.js";
-import { api, settings, state } from "./store.js";
+import { api, settings, state, liveFetch } from "./store.js";
 import { ltHtml } from "./time.js";
 import { go, openDrawer } from "./app.js";
 
@@ -57,7 +57,13 @@ async function run() {
     lastQ = "";
   }
   render();
+  // on-the-fly mode: look the words up in Active Directory too, then show what arrived
+  if (state.meta?.live?.on && !ask && q.length >= 2 && !/[:"]/.test(q)) {
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(() => liveFetch("search", { q }).then((ch) => { if (ch && input.value.trim() === q) run(); }), 350);
+  }
 }
+let liveTimer;
 
 function render() {
   if (!ctx) return;

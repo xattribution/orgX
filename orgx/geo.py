@@ -155,7 +155,7 @@ class OuLearner:
             if len(vals) < 2 or not self.total or n / self.total < 0.4:
                 continue
             boxes = sum(e[0] for v, e in vals.items() if CONTAINER.match(v.strip()))
-            if boxes / n > 0.5 or len(vals) > max(2, n / 4):
+            if boxes / n > 0.5 or len(vals) > max(3, n / 2):
                 continue
             with_city = [e for e in vals.values() if e[1]]
             if with_city:

@@ -196,7 +196,7 @@ def scheduler(ctx):
         try:
             cfg = config(ctx)
             hours = float(cfg.get("hours") or 0)
-            if hours <= 0 or not shell() or ctx.job["running"]:
+            if hours <= 0 or cfg.get("mode") == "live" or not shell() or ctx.job["running"]:
                 continue
             last = state(ctx).get("last_sync")
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600 if last else 1e9

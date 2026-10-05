@@ -79,8 +79,33 @@ Try it from a terminal first:
 
 It pulls every mail-enabled object (users, org boxes, groups, contacts, rooms) with
 OU path, manager, membership (ranged, so large DLs are complete) and the Exchange
-recipient type. Output streams to CSV, so memory stays flat on very large directories.
+recipient type. Each object is written to the CSV as it arrives (the directory searcher's
+result cache is off), so memory stays flat and the file grows steadily on very large
+directories.
 `-SearchBase` takes several bases separated by `;`. `-SkipMembers` makes a quick pass.
+
+### On the fly
+
+Set **Mode** to *On the fly* to skip the full export. ORGX then looks things up as you
+go and keeps what it finds, so the local directory grows around what you actually use:
+
+- **Search**: the words are resolved the way the Outlook address book does (`anr`), and
+  an OU whose name starts with them (a site) brings that OU's objects in.
+- **Open a person**: their manager and the manager's manager, their peers, their reports
+  and their reports' reports.
+- **Open a unit**: everyone whose department is that unit or below it.
+- **Open a base**: the site OU it was learned from.
+
+Results land in `data/org.db` with the same normalization as an export, and org trees,
+bases and the search index are rebuilt after each lookup. A lookup isn't repeated until
+**Look up again after** has passed. Scheduled full syncs pause in this mode; **Sync now**
+still runs one.
+
+The server keeps `tools/ADLookup.ps1 -Serve` running and sends it one JSON line per
+request (`search`, `dn`, `reports`, `dept`, `ous`, `ou`). Where PowerShell can't read
+stdin line by line, it runs the script once per request with `-Request <file>`. Both
+scripts share `tools/ADCommon.ps1`. To try the mode without a domain, point
+`ORGX_LIVE_CSV` at an export file; lookups are then answered from it.
 
 ### Who am I
 
@@ -107,7 +132,7 @@ The snapshot date is taken from a date in the file name (`gal_20260915.csv`,
 ### Columns
 
 Headers are matched case- and punctuation-insensitively. Both the Exchange/PowerShell
-names and raw LDAP names work. Columns it doesn't recognise are kept and shown
+names and raw LDAP names work. Columns it doesn't recognize are kept and shown
 under **All directory attributes**.
 
 | Field | Accepted headers |
@@ -272,6 +297,7 @@ Everything the UI does is a JSON call. Useful for scripts and bots:
 | `POST /api/group` · `/api/group/import` · `/api/resolve` | create/update/delete groups and members, import a share file, match a pasted list |
 | `GET /api/emails?q=\|keys=\|group=&style=&sep=&pick=&exclude=&batch=&field=` | email list batches, mail links, recipients |
 | `GET /api/whoami` · `/api/ad` · `POST /api/ad/test` · `/api/ad/sync` | identity, AD connector status, test bind, sync |
+| `GET /api/live` · `POST /api/live/search\|person\|unit\|site` (`{q}`, `{key}`, `{id}`) | on-the-fly status and lookups; each returns added/updated counts or `cached` |
 | `POST /api/note` · `/api/rules` | team notes, rules |
 
 ## Layout
@@ -288,12 +314,15 @@ orgx/
   groups.py            groups, share files, paste matching
   mail.py              email list builder
   adsync.py            whoami + AD connector (runs the PowerShell export)
+  live.py              on-the-fly lookups: lookup worker, upsert, rebuild
   api.py               JSON handlers
   reference.py         ranks, functions, kinds, topics, leadership
   rules.py · db.py     data/rules.json overlay · schema
 web/                   index.html, css/app.css, js/ (ES modules, no build step), fonts/ (Public Sans, IBM Plex Sans Condensed, Atkinson Hyperlegible Mono; OFL)
 tools/
-  Export-ADDirectory.ps1   AD → CSV (RSAT or ADSI, -Test)
+  Export-ADDirectory.ps1   AD → CSV, streamed (RSAT or ADSI, -Test)
+  ADLookup.ps1             targeted lookups for on-the-fly mode (-Serve, -Request)
+  ADCommon.ps1             shared searcher, columns and CSV writer
   make_synthetic.py        fictional AD-shaped demo data with churn (--scale, --snapshots)
   build_geo.py             regenerates web/js/geo-data.js + data/centroids.json
 data/centroids.json    country centroids · data/sites.json (optional, local only) your site coordinates

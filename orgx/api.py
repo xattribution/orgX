@@ -17,7 +17,7 @@ from pathlib import Path
 from . import db as dbm
 from . import ingest as ing
 from . import reference as ref
-from . import adsync, groups, mail, route
+from . import adsync, groups, live, mail, route
 from . import rules as R
 from .query import ORDER, compile_query
 
@@ -76,6 +76,7 @@ def meta(ctx, p, b):
         "tiers": [{"id": k, "label": v} for k, v in ref.TIER_LABEL.items()],
         "job": job_status(ctx, p, b),
         "fts": dbm.has_fts5(),
+        "live": live.status(ctx),
     }
     if conn is None:
         return {**base, "empty": True}
@@ -626,7 +627,27 @@ def _bases(ctx):
 def save_rules(ctx, p, b):
     cur = ctx.rules()
     cur.update({k: v for k, v in (b or {}).items() if k in R.DEFAULTS})
-    return {"rules": R.save(ctx.data_dir, cur)}
+    saved = R.save(ctx.data_dir, cur)
+    if (saved.get("ad") or {}).get("mode") == "live":
+        live.ensure_db(ctx)          # on-the-fly mode starts from an empty directory if there is none
+    return {"rules": saved}
+
+
+# ---------------------------------------------------------------- on the fly
+def live_search(ctx, p, b):
+    return live.search(ctx, str((b or {}).get("q", "")))
+
+
+def live_person(ctx, p, b):
+    return live.person(ctx, str((b or {}).get("key", "")))
+
+
+def live_unit(ctx, p, b):
+    return live.unit(ctx, str((b or {}).get("id", "")))
+
+
+def live_site(ctx, p, b):
+    return live.site(ctx, str((b or {}).get("id", "")))
 
 
 def job_status(ctx, p, b):
@@ -734,10 +755,11 @@ GET = {
     "/api/ask": ask, "/api/topics": topics, "/api/changes": changes, "/api/quality": quality, "/api/export": export,
     "/api/note": get_note, "/api/tags": tags, "/api/rules": get_rules, "/api/job": job_status, "/api/sources": sources,
     "/api/groups": groups.list_all, "/api/group": groups.get, "/api/group/export": groups.export,
-    "/api/emails": mail.build, "/api/whoami": adsync.whoami, "/api/ad": adsync.status,
+    "/api/emails": mail.build, "/api/whoami": adsync.whoami, "/api/ad": adsync.status, "/api/live": live.status,
 }
 POST = {
     "/api/demo": demo, "/api/reset": reset, "/api/note": save_note, "/api/rules": save_rules, "/api/reingest": reingest,
     "/api/group": groups.save, "/api/group/import": groups.import_bundle, "/api/resolve": groups.resolve_text,
     "/api/ad/test": adsync.test, "/api/ad/sync": adsync.sync,
+    "/api/live/search": live_search, "/api/live/person": live_person, "/api/live/unit": live_unit, "/api/live/site": live_site,
 }

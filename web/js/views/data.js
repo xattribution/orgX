@@ -35,8 +35,10 @@ async function sources(body) {
           <label>Domain</label><input class="input mono" data-ad="server" value="${attr(ad.config.server)}" placeholder="Your own domain">
           <label>Search bases</label><div><textarea class="input mono" rows="2" style="width:100%" data-ad="bases" placeholder="Blank: the whole domain. One DN per line, e.g. OU=Sites,DC=corp,DC=example">${esc((ad.config.bases || []).join("\n"))}</textarea></div>
           <label>Method ${info('ADSI uses the .NET directory searcher built into Windows with your Kerberos sign-in, the same way AD Explorer connects. RSAT uses the ActiveDirectory module and is needed if PowerShell runs in Constrained Language mode.')}</label><div><select class="input" data-ad="method">${["Auto", "ADSI", "RSAT"].map((m) => `<option ${ad.config.method === m ? "selected" : ""}>${m}</option>`).join("")}</select></div>
-          <label>Group members</label><label class="chk"><input type="checkbox" data-ad="members" ${ad.config.members ? "checked" : ""}>Export DL membership (slower on large domains)</label>
-          <label>Schedule</label><div><select class="input" data-ad="hours">${[[0, "Manual only"], [6, "Every 6 hours"], [12, "Every 12 hours"], [24, "Daily"], [168, "Weekly"]].map(([h, l]) => `<option value="${h}" ${+ad.config.hours === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="export">Group members</label><label class="chk" data-for="export"><input type="checkbox" data-ad="members" ${ad.config.members ? "checked" : ""}>Export DL membership (slower on large domains)</label>
+          <label>Mode ${info("Full export reads the whole directory into ORGX on a schedule. On the fly looks up only what you search for or open, with a couple of levels above and below it, and keeps it.")}</label><div><select class="input" data-ad="mode">${[["export", "Full export"], ["live", "On the fly"]].map(([v, l]) => `<option value="${v}" ${(ad.config.mode || "export") === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="live">Look up again after</label><div data-for="live"><select class="input" data-ad="liveHours">${[[1, "1 hour"], [4, "4 hours"], [12, "12 hours"], [24, "1 day"], [168, "1 week"]].map(([h, l]) => `<option value="${h}" ${+(ad.config.liveHours || 12) === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="export">Schedule</label><div data-for="export"><select class="input" data-ad="hours">${[[0, "Manual only"], [6, "Every 6 hours"], [12, "Every 12 hours"], [24, "Daily"], [168, "Weekly"]].map(([h, l]) => `<option value="${h}" ${+ad.config.hours === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
         </div>
         <div style="display:flex;gap:6px;margin:10px 0"><button class="btn" data-adsave>Save</button><button class="btn" data-adtest>Test connection</button><button class="btn primary" data-adsync ${job.running ? "disabled" : ""}>Sync now</button></div>
         <div data-adout>${st.test ? testHtml(st.test, st.last_test) : ""}${st.last_sync ? `<p class="note">Last sync ${esc(st.last_sync.replace("T", " ").slice(0, 16))}Z${st.sync?.count ? `, ${fmt(st.sync.count)} objects in ${st.sync.seconds} s by ${esc(st.sync.method)}` : ""}.</p>` : ""}</div>`
@@ -74,8 +76,12 @@ async function sources(body) {
     server: body.querySelector("[data-ad=server]").value.trim(), method: body.querySelector("[data-ad=method]").value,
     bases: body.querySelector("[data-ad=bases]").value.split("\n").map((s) => s.trim()).filter(Boolean),
     members: body.querySelector("[data-ad=members]").checked, hours: +body.querySelector("[data-ad=hours]").value,
+    mode: body.querySelector("[data-ad=mode]").value, liveHours: +body.querySelector("[data-ad=liveHours]").value,
   });
-  body.querySelector("[data-adsave]")?.addEventListener("click", async () => { await post("/api/rules", { ad: adcfg() }); say("AD settings saved"); });
+  const modeSel = body.querySelector("[data-ad=mode]");
+  const showMode = () => body.querySelectorAll("[data-for]").forEach((el) => { el.hidden = el.dataset.for !== modeSel.value; });
+  if (modeSel) { modeSel.onchange = showMode; showMode(); }
+  body.querySelector("[data-adsave]")?.addEventListener("click", async () => { await post("/api/rules", { ad: adcfg() }); await refreshMeta(); say("AD settings saved"); });
   body.querySelector("[data-adtest]")?.addEventListener("click", async (e) => {
     await post("/api/rules", { ad: adcfg() });
     e.target.disabled = true;

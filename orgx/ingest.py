@@ -53,11 +53,11 @@ def rows(path: Path):
     fh.seek(0)
     if first.startswith("#TYPE"):
         fh.readline()
-    try:
-        dialect = csv.Sniffer().sniff(sample.split("\n", 1)[0], delimiters=",\t;|")
+    try:      # sniff only the delimiter; quoting is always standard ("" inside a quoted field)
+        delim = csv.Sniffer().sniff(sample.split("\n", 1)[0], delimiters=",\t;|").delimiter
     except csv.Error:
-        dialect = csv.excel
-    reader = csv.reader(fh, dialect)
+        delim = ","
+    reader = csv.reader(fh, delimiter=delim)
     header = next(reader, [])
     yield header
     for r in reader:
@@ -370,6 +370,45 @@ def build_orgs(b: Builder, mgr_links: dict[str, Counter]) -> dict[str, dict]:
     return orgs
 
 
+def manager_links(conn: sqlite3.Connection) -> dict[str, Counter]:
+    """top-level org → {org its people's managers sit in: count}"""
+    links: dict[str, Counter] = defaultdict(Counter)
+    for oid, moid, n in conn.execute("""SELECT o.org_id, m.org_id, count(*) FROM objects o
+            JOIN objects m ON m.key = o.manager_key
+            WHERE o.org_id <> '' AND m.org_id <> '' AND o.org_id <> m.org_id GROUP BY 1, 2"""):
+        links[oid.split("/")[0]][moid] += n
+    return links
+
+
+def write_orgs(conn: sqlite3.Connection, orgs: dict[str, dict]) -> None:
+    conn.execute("DELETE FROM orgs")
+    conn.executemany(
+        "INSERT INTO orgs VALUES (:id,:name,:parent,:depth,:kind,:fn,:direct,:total,:people,:leader_key,"
+        ":leader_by,:loc_id,:locs,:inferred,:lft,:rgt,:sort,:site)", list(orgs.values()))
+    conn.execute("UPDATE objects SET org_lft = (SELECT lft FROM orgs WHERE orgs.id = objects.org_id)")
+
+
+class DbAggregates:
+    """The per-org totals build_orgs needs, recomputed from the objects table (on-the-fly mode)."""
+
+    def __init__(self, conn: sqlite3.Connection, rules: dict):
+        self.rules = rules
+        self.org_direct: Counter = Counter()
+        self.org_people: Counter = Counter()
+        self.org_best: dict[str, tuple] = {}
+        self.org_locs: dict[str, Counter] = defaultdict(Counter)
+        for key, kind, org_id, loc_id, lead, level in conn.execute(
+                "SELECT key, kind, org_id, loc_id, leader, level FROM objects WHERE org_id <> ''"):
+            self.org_direct[org_id] += 1
+            if loc_id:
+                self.org_locs[org_id][loc_id] += 1
+            if kind == "person":
+                self.org_people[org_id] += 1
+                cand = (lead or 0, level or 0, key)
+                if org_id not in self.org_best or cand[:2] > self.org_best[org_id][:2]:
+                    self.org_best[org_id] = cand
+
+
 # ---------------------------------------------------------------- diff
 # (type, row source, before, after, where). Rows come from n (new) and/or o (old).
 _J = "main.objects n JOIN old.objects o ON o.key = n.key"
@@ -515,17 +554,8 @@ def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None) 
             JOIN objects g ON lower(g.{via}) = substr(s.group_key, 2) WHERE substr(s.group_key, 1, 1) = '@'""")
     conn.execute("DROP TABLE stage_members")
 
-    mgr_links: dict[str, Counter] = defaultdict(Counter)
-    for oid, moid, n in conn.execute("""SELECT o.org_id, m.org_id, count(*) FROM objects o
-            JOIN objects m ON m.key = o.manager_key
-            WHERE o.org_id <> '' AND m.org_id <> '' AND o.org_id <> m.org_id GROUP BY 1, 2"""):
-        mgr_links[oid.split("/")[0]][moid] += n
-
-    orgs = build_orgs(b, mgr_links)
-    conn.executemany(
-        "INSERT INTO orgs VALUES (:id,:name,:parent,:depth,:kind,:fn,:direct,:total,:people,:leader_key,"
-        ":leader_by,:loc_id,:locs,:inferred,:lft,:rgt,:sort,:site)", list(orgs.values()))
-    conn.execute("UPDATE objects SET org_lft = (SELECT lft FROM orgs WHERE orgs.id = objects.org_id)")
+    orgs = build_orgs(b, manager_links(conn))
+    write_orgs(conn, orgs)
     conn.executemany(
         "INSERT INTO locations VALUES (:id,:name,:full,:lat,:lon,:tz,:country,:state,:region,:approx,:ou,:total,:people)",
         [{**loc, "total": b.loc_total[lid], "people": b.loc_people[lid]} for lid, loc in b.locs.items()])

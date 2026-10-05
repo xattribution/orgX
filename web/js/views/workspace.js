@@ -3,7 +3,7 @@
    Search lives in the header and drops results over the canvas; picking someone shows where
    they sit in the chart. */
 import { $, esc, attr, fmt, debounce, icon, shortOrg } from "../ui.js";
-import { api, state, settings, save, isStarred } from "../store.js";
+import { api, state, settings, save, isStarred, liveFetch } from "../store.js";
 import { ltHtml } from "../time.js";
 import { setParams, openDrawer } from "../app.js";
 import { openEmailBuilder } from "../email.js";
@@ -38,6 +38,7 @@ export default {
     bindChart();
     window.addEventListener("resize", fitSoon);
     window.addEventListener("orgx:data", reloadAll);
+    window.addEventListener("orgx:live", liveArrived);
     renderRail();
     applyCanvas(r);
     loadTree();
@@ -58,10 +59,13 @@ export default {
     mapMounted = false;
     window.removeEventListener("resize", fitSoon);
     window.removeEventListener("orgx:data", reloadAll);
+    window.removeEventListener("orgx:live", liveArrived);
   },
 };
 
 function reloadAll() { loadTree(); loadStrip(); renderRail(); }
+// on-the-fly mode: records arrived from Active Directory; redraw what shows them (once, after a burst)
+const liveArrived = debounce(() => { loadTree(); loadStrip(); if (!root.querySelector("[data-unitfilter]")?.value) (railTab === "bases" ? renderBases() : loadUnits()); }, 300);
 const fitSoon = debounce(() => { if (canvas === "chart") drawChart(true); }, 80);
 
 /* ---------------------------------------------------------------- card: person, or the unit when nobody is picked */
@@ -164,6 +168,7 @@ async function loadTree() {
   tree = t;
   renderCrumbs();
   drawChart(true);
+  if (u) liveFetch("unit", { id: u });      // on-the-fly mode: fill this unit in from Active Directory
 }
 function renderCrumbs() {
   const chain = [{ id: "", name: "All units" }, ...(tree.chain || []), ...(u ? [{ id: tree.id, name: tree.name }] : [])];

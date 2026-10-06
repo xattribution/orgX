@@ -26,11 +26,13 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import adsync
 from . import db as dbm
+from . import fold
 from . import geo
 from . import ingest as ing
 from . import parse as P
@@ -291,7 +293,24 @@ def upsert(ctx, raw: list[dict]) -> dict:
         levels = learner.result()
         ing.save_learned(conn, learner, levels)
 
-        b = ing.Builder(ctx.data_dir, rules, levels)
+        # unit spellings: what is stored plus what arrived, folded the same way a full load does
+        roots = Counter()
+        for dept, n in conn.execute("SELECT dept, count(*) FROM objects WHERE dept <> '' GROUP BY dept"):
+            path = P.org_path(dept, "")
+            if path:
+                roots[path[0]] += n
+        for r in raw:
+            path = P.org_path(P.clean(str(r.get(cmap.get("department", ""), "") or "")), "")
+            if path:
+                roots[path[0]] += 1
+        folds, suggestions = ing.plan_folds(roots, rules)
+        for f in folds:          # rows stored under a spelling that now folds move with it
+            conn.execute("UPDATE objects SET org_id = ? || substr(org_id, ?) WHERE org_id = ? OR org_id LIKE ? ESCAPE '\\'",
+                         (f["into"], len(f["from"]) + 1, f["from"], f["from"].replace("%", "\\%").replace("_", "\\_") + "/%"))
+        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                         [("folds", json.dumps(folds)), ("fold_suggestions", json.dumps(suggestions))])
+
+        b = ing.Builder(ctx.data_dir, rules, levels, fold.mapping(folds))
         mapped = set(cmap.values())
         cols = dbm.OBJECT_COLS
         sql = (f"INSERT INTO objects ({','.join(cols)}) VALUES ({','.join('?' * len(cols))}) "
@@ -324,10 +343,11 @@ def upsert(ctx, raw: list[dict]) -> dict:
 
 def rebuild(conn: sqlite3.Connection, rules: dict) -> None:
     """Managers, org tree, site totals and the search index, from what is in the table."""
-    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE m.dn = objects.manager_dn LIMIT 1)
+    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE m.dn = objects.manager_dn COLLATE NOCASE LIMIT 1)
         WHERE manager_dn <> '' AND instr(manager_dn, '=') > 0""")
     orgs = ing.build_orgs(ing.DbAggregates(conn, rules), ing.manager_links(conn))
     ing.write_orgs(conn, orgs)
+    ing.write_fns(conn)
     conn.execute("""UPDATE locations SET total = (SELECT count(*) FROM objects o WHERE o.loc_id = locations.id),
         people = (SELECT count(*) FROM objects o WHERE o.loc_id = locations.id AND o.kind = 'person')""")
     n = conn.execute("SELECT count(*), sum(kind = 'person') FROM objects").fetchone()

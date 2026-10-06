@@ -273,7 +273,7 @@ def resolve_text(ctx, p, b):
             continue
         seen.add(email)
         r = conn.execute(f"SELECT {LIVE_COLS} FROM objects o LEFT JOIN locations l ON l.id = o.loc_id "
-                         f"WHERE lower(o.email) = ? OR lower(o.upn) = ? LIMIT 1", (email, email)).fetchone()
+                         f"WHERE o.email = ? COLLATE NOCASE LIMIT 1", (email,)).fetchone()
         items.append({"input": email, "label": (m.group(1) or "").strip(), "match": rowdict(r) if r else None, "candidates": []})
     rest = addr.sub(" ", text)   # what is left is names without addresses
     for line in re.split(r"[;\n]+", rest):

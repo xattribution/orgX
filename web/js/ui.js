@@ -35,6 +35,25 @@ const P = {
   check: '<path d="m5 12 5 5L20 7"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
 };
+/* A clear button inside a search field: shown while it has text, empties it, keeps focus.
+   Returns sync() for callers that set the value themselves. */
+export function clearable(input, onClear) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "clr";
+  b.title = "Clear (Esc)";
+  b.setAttribute("aria-label", "Clear search");
+  b.innerHTML = icon("x");
+  input.after(b);
+  const box = input.parentElement;
+  const sync = () => { b.hidden = !input.value; box.classList.toggle("filled", !!input.value); };
+  input.addEventListener("input", sync);
+  b.addEventListener("mousedown", (e) => e.preventDefault());
+  b.addEventListener("click", () => { input.value = ""; sync(); onClear(); input.focus(); });
+  sync();
+  return sync;
+}
+
 export function icon(name, cls = "") {
   return `<svg class="i ${cls}" viewBox="0 0 24 24" aria-hidden="true">${P[name] || ""}</svg>`;
 }

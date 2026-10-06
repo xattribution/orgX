@@ -253,15 +253,25 @@ class Gazetteer:
     def place(self, ous: list[str], anchors: list[str], office: str, city: str, state: str, country: str) -> dict:
         region, inst = self.installation_ou(ous, anchors)
         base = self.match_exact(inst) if inst else ""
-        if not base:
+        if not base and not inst:
             for o in reversed(ous):
                 base = self.match_exact(o)
                 if base:
                     break
+        near = ""
         if not base:
-            base = self.match_text(office) or self.match_text(city)
+            hint = self.match_text(inst) or self.match_text(office) or self.match_text(city)
+            if inst:
+                near = hint      # a learned site OU is its own place; a known site only lends coordinates
+            else:
+                base = hint
         cc = country_code(country)
         st = state_code(state)
+        if near:
+            b = self.bases[near]
+            return {"id": f"ou:{inst}", "name": inst, "full": inst, "lat": b["lat"], "lon": b["lon"],
+                    "tz": b.get("tz", ""), "country": b.get("country", cc), "state": b.get("state", st),
+                    "region": region, "approx": 0, "ou": inst}
         if base:
             b = self.bases[base]
             return {"id": base, "name": base, "full": b.get("full", base), "lat": b["lat"], "lon": b["lon"],

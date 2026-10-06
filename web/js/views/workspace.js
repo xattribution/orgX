@@ -2,7 +2,7 @@
    the selected person or unit on the right, and the people of the selected unit underneath.
    Search lives in the header and drops results over the canvas; picking someone shows where
    they sit in the chart. */
-import { $, esc, attr, fmt, debounce, icon, shortOrg } from "../ui.js";
+import { $, esc, attr, fmt, debounce, icon, shortOrg, clearable } from "../ui.js";
 import { api, state, settings, save, isStarred, liveFetch } from "../store.js";
 import { ltHtml } from "../time.js";
 import { setParams, openDrawer } from "../app.js";
@@ -11,7 +11,7 @@ import mapView from "./map.js";
 
 const NW = 200, NH = 66, GX = 22, GY = 14, LV = 56;     // chart node size and gaps
 let root, ws, u = "", canvas = "chart", tree = null, view = { x: 0, y: 0, k: 1 }, drag = null, personOrg = "", mapMounted = false;
-let reqTree = 0, reqStrip = 0, stripScope = "direct", railTab = "units";
+let reqTree = 0, reqStrip = 0, stripScope = "direct", railTab = "units", syncFilter = () => {};
 
 export default {
   id: "home", label: "People", key: "p",
@@ -92,8 +92,11 @@ const pickUnit = (id) => setParams({ u: id, d: id ? "o:" + id : "" }, { replace:
 function renderRail() {
   $("#rail", root).innerHTML = `
     <span class="seg sm rail-tabs" role="group" aria-label="Browse by"><button data-rtab="units" class="${railTab === "units" ? "on" : ""}">Units</button><button data-rtab="bases" class="${railTab === "bases" ? "on" : ""}">Bases</button></span>
-    <input class="input" data-unitfilter placeholder="Filter" aria-label="Filter units or bases">
+    <span class="fwrap"><input class="input" data-unitfilter placeholder="Filter" aria-label="Filter units or bases"></span>
     <div class="utree" id="utree"><div class="loading">Loading…</div></div>`;
+  const f = root.querySelector("[data-unitfilter]");
+  syncFilter = clearable(f, () => (railTab === "bases" ? renderBases() : loadUnits()));
+  f.addEventListener("keydown", (e) => { if (e.key === "Escape" && f.value) { e.stopPropagation(); f.value = ""; syncFilter(); railTab === "bases" ? renderBases() : loadUnits(); } });
   railTab === "bases" ? renderBases() : loadUnits();
 }
 function renderBases(q = "") {
@@ -114,7 +117,20 @@ async function onRailFilter(e) {
   if (railTab === "bases") return renderBases(q);
   if (!q) return loadUnits();
   const rows = await api("/api/orgs", { q }).catch(() => []);
-  $("#utree", root).innerHTML = rows.map((o) => `<div class="un" style="--d:0"><span class="tw"></span><button class="ul${o.id === u ? " on" : ""}" data-unit="${attr(o.id)}" title="${attr(o.id)}"><span class="ellip">${esc(o.id)}</span><span class="n">${fmt(o.people)}</span></button></div>`).join("") || `<p class="note">No unit matches.</p>`;
+  if (e.target.value.trim() !== q) return;            // typed on while this was loading
+  // matches grouped under their top unit, so the shared prefix is read once
+  const groups = new Map();
+  for (const o of rows) {
+    const top = o.id.split("/")[0];
+    if (!groups.has(top)) groups.set(top, { top, self: null, kids: [] });
+    const g = groups.get(top);
+    if (o.id === top) g.self = o; else g.kids.push(o);
+  }
+  const line = (id, label, n, d, kids) => `<div class="un" style="--d:${d}">${kids ? `<button class="tw" data-tw="${attr(id)}" aria-label="Expand">+</button>` : `<span class="tw"></span>`}<button class="ul${id === u ? " on" : ""}" data-unit="${attr(id)}" title="${attr(id)}"><span class="ellip">${esc(label)}</span><span class="n">${n == null ? "" : fmt(n)}</span></button></div>${kids ? `<div class="kids" data-kids="${attr(id)}"></div>` : ""}`;
+  const byPath = (a, b) => a.id.localeCompare(b.id, "en", { numeric: true });
+  $("#utree", root).innerHTML = [...groups.values()].map((g) =>
+    line(g.top, g.top, g.self?.people, 0, g.self?.kids) + g.kids.sort(byPath).map((o) => line(o.id, o.id.slice(g.top.length + 1), o.people, 1, o.kids)).join("")).join("")
+    || `<p class="note">No unit matches.</p>`;
 }
 function markTree() {
   root.querySelectorAll("#utree .ul").forEach((b) => b.classList.toggle("on", b.dataset.unit === u));

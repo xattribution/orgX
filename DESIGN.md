@@ -124,4 +124,7 @@ lives under Data, out of the way.
 | (i) tips | The few terms that need explaining | No explainer text printed on pages |
 | On-the-fly results fill in place, with no spinner | Records that arrived from AD after the first draw | Lookups take well under a second; a loader would flash |
 | AD settings show only the current mode's fields | Export settings or lookup settings, never both | No disabled or irrelevant controls |
+| × inside a search field while it has text; Esc clears first, leaves second | How to get back to everything | A visible way out of a search; the field empties after you pick a result |
+| Unit filter results nested under their top unit, with + to expand | Where a match sits, read once instead of repeated on every row | The rail's own tree, filtered |
+| Merged spellings listed per unit with a tick to keep one separate | What ORGX folded together and how to undo it | Automatic merges stay reviewable |
 | Dashed outline on map markers | Approximate placement | Position confidence, shown without color |

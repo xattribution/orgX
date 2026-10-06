@@ -136,6 +136,18 @@ async function quality(body) {
         ${q.approx.map((a) => `<tr><td><b>${esc(a.name)}</b><div class="note">${esc(a.full || "")}</div></td><td>${esc(a.region || a.country || "")}</td><td class="num">${fmt(a.total)}</td>
           <td><select class="input" data-alias="${attr(a.ou || a.name)}"><option value="">(none)</option>${rr.bases.map((b) => `<option ${rr.rules.baseAliases?.[a.ou || a.name] === b ? "selected" : ""}>${esc(b)}</option>`).join("")}</select></td></tr>`).join("")}
         </tbody></table><div style="margin-top:8px"><button class="btn primary sm" data-save-alias>Save and reload</button></div>` : ""}
+      ${q.folds?.length ? `<h2 class="h">Unit spellings merged <span class="n">${fmt(q.foldCount)}</span> ${info("Spellings of one unit that differ only in case, spacing or punctuation, or that carry a country or service tag in front (US…, AU USSF …), are filed under the spelling most people use.")}</h2>
+        <table class="tbl"><thead><tr><th>Filed under</th><th>Also written as (tick to keep separate)</th><th class="num">Records</th></tr></thead><tbody>
+        ${q.folds.map((g) => `<tr><td><a data-org="${attr(g.into)}">${esc(g.into)}</a></td>
+          <td class="variants">${g.variants.map((f) => `<label class="chk"><input type="checkbox" data-separate="${attr(f.from)}" ${(rr.rules.orgSeparate || []).includes(f.from) ? "checked" : ""}>${esc(f.from)} <span class="dim">${fmt(f.n)}</span></label>`).join("")}</td>
+          <td class="num">${fmt(g.n)}</td></tr>`).join("")}
+        </tbody></table>${q.folds.length < q.foldCount ? `<p class="note">The units with the most merged records are shown.</p>` : ""}` : ""}
+      ${q.suggestions?.length ? `<h2 class="h">Possibly the same unit ${info("One character apart. Not merged unless you choose to.")}</h2>
+        <table class="tbl"><thead><tr><th>Spelling</th><th>Looks like</th><th class="num">Records</th><th></th></tr></thead><tbody>
+        ${q.suggestions.map((f) => `<tr><td>${esc(f.from)}</td><td>${esc(f.into)} <span class="dim">${fmt(f.into_n)}</span></td><td class="num">${fmt(f.n)}</td>
+          <td><label class="chk"><input type="checkbox" data-merge="${attr(f.from)}" data-into="${attr(f.into)}" ${rr.rules.orgAliases?.[f.from] === f.into ? "checked" : ""}>Merge</label></td></tr>`).join("")}
+        </tbody></table>` : ""}
+      ${q.folds?.length || q.suggestions?.length ? `<div style="margin:8px 0 0"><button class="btn primary sm" data-save-folds>Save and reload</button></div>` : ""}
       ${q.leaderless.length ? `<h2 class="h">Offices with no leadership title ${info("The lead falls back to the most senior member.")}</h2>
         <table class="tbl"><tbody>${q.leaderless.map((o) => `<tr class="click" data-org="${attr(o.id)}"><td>${esc(o.id)}</td><td class="dim">${o.senior ? esc((o.rank || "") + " " + o.senior) : ""}</td><td class="num">${o.people}</td></tr>`).join("")}</tbody></table>` : ""}
     </div><div>
@@ -146,6 +158,15 @@ async function quality(body) {
         <table class="tbl"><tbody>${q.inferred.map((o) => `<tr><td><a data-org="${attr(o.id)}">${esc(o.id)}</a></td><td>under <a data-org="${attr(o.parent)}">${esc(o.parent)}</a></td><td class="dim">${esc(o.inferred)}</td></tr>`).join("")}</tbody></table>` : ""}
       ${q.dups.length ? `<h2 class="h">Shared email addresses</h2><table class="tbl"><tbody>${q.dups.map((d) => `<tr><td><a data-q="email:${attr(d.email)}">${esc(d.email)}</a></td><td class="num">${d.n}</td><td class="dim">${esc(d.names)}</td></tr>`).join("")}</tbody></table>` : ""}
     </div></div>`;
+  body.querySelector("[data-save-folds]")?.addEventListener("click", async () => {
+    const separate = new Set(rr.rules.orgSeparate || []);
+    body.querySelectorAll("[data-separate]").forEach((c) => { if (c.checked) separate.add(c.dataset.separate); else separate.delete(c.dataset.separate); });
+    const aliases = { ...(rr.rules.orgAliases || {}) };
+    body.querySelectorAll("[data-merge]").forEach((c) => { if (c.checked) aliases[c.dataset.merge] = c.dataset.into; else if (aliases[c.dataset.merge] === c.dataset.into) delete aliases[c.dataset.merge]; });
+    await post("/api/rules", { orgSeparate: [...separate], orgAliases: aliases });
+    const r = await post("/api/reingest", {});
+    say(r.error ? esc(r.error) : "Reloading with the new unit rules");
+  });
   body.querySelector("[data-save-alias]")?.addEventListener("click", async () => {
     const aliases = { ...(rr.rules.baseAliases || {}) };
     body.querySelectorAll("[data-alias]").forEach((s) => { if (s.value) aliases[s.dataset.alias] = s.value; else delete aliases[s.dataset.alias]; });

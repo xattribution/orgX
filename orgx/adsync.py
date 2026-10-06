@@ -73,10 +73,10 @@ def whoami(ctx, p, b):
         return out
     row = None
     if ident.get("dn"):
-        row = conn.execute("SELECT key FROM objects WHERE lower(dn) = lower(?)", (ident["dn"],)).fetchone()
+        row = conn.execute("SELECT key FROM objects WHERE dn = ? COLLATE NOCASE", (ident["dn"],)).fetchone()
     if not row and ident.get("upn"):
-        row = conn.execute("SELECT key FROM objects WHERE lower(upn) = lower(?) OR lower(email) = lower(?)",
-                           (ident["upn"], ident["upn"])).fetchone()
+        row = (conn.execute("SELECT key FROM objects WHERE email = ? COLLATE NOCASE", (ident["upn"],)).fetchone()
+               or conn.execute("SELECT key FROM objects WHERE lower(upn) = lower(?)", (ident["upn"],)).fetchone())
     if not row and ident.get("user") and ident.get("domain"):
         row = conn.execute("SELECT key FROM objects WHERE lower(sam) = lower(?) AND lower(domain) = lower(?)",
                            (ident["user"], ident["domain"])).fetchone()

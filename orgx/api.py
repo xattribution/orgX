@@ -19,7 +19,7 @@ from . import ingest as ing
 from . import reference as ref
 from . import adsync, groups, live, mail, route
 from . import rules as R
-from .query import ORDER, compile_query
+from .query import ORDER, _facet_field, compile_query
 
 ROW_COLS = ("o.key, o.kind, o.name, o.first, o.last, o.mi, o.display, o.rank, o.grade, o.title, o.org_id, o.loc_id, o.phone, o.dsn, "
             "o.mobile, o.email, o.fn, o.fns, o.leader, o.category, o.tier, o.disabled, o.office, o.career, "
@@ -33,9 +33,34 @@ class Ctx:
         self.data_dir = data_dir
         self.job = {"running": False, "log": [], "result": None, "error": None, "started": None, "source": None}
         self.lock = threading.Lock()
+        self.pool = dbm.Pool(data_dir)
+        self._local = threading.local()
+        self.writes = 0              # bumped by in-process writes, so cached answers never go stale
 
     def conn(self) -> sqlite3.Connection | None:
-        return dbm.connect(self.data_dir)
+        """Inside a request (begin/end), a pooled connection reused for the whole request;
+        elsewhere a fresh one."""
+        held = getattr(self._local, "held", None)
+        if held is None:
+            return dbm.connect(self.data_dir)
+        if not held:
+            item = self.pool.get()
+            if item is None:
+                return None
+            held.append(item)
+        return held[0][1]
+
+    def begin(self) -> None:
+        self._local.held = []
+
+    def end(self) -> None:
+        for item in getattr(self._local, "held", None) or []:
+            self.pool.put(item)
+        self._local.held = None
+
+    def version(self) -> tuple:
+        d = self.data_dir
+        return (dbm.identity(d / "org.db"), dbm.identity(d / "annotations.db"), dbm.identity(d / "rules.json"), self.writes)
 
     def rules(self):
         return R.load(self.data_dir)
@@ -137,17 +162,31 @@ def facets(ctx, p, b):
     has_fts = dbm.has_fts5()
     out = {}
 
-    def counts(field, expr, extra_join="", limit=40, where_extra=""):
-        w, prm = c.sql(skip_field=field, has_fts=has_fts)
-        sql = (f"SELECT {expr} AS v, count(*) AS n FROM objects o {extra_join} WHERE {w} {where_extra} "
-               f"GROUP BY v ORDER BY n DESC LIMIT {limit}")
-        return [[r["v"], r["n"]] for r in conn.execute(sql, prm) if r["v"] not in (None, "")]
-
-    out["kind"] = counts("kind", "o.kind")
-    out["fn"] = counts("fn", "o.fn", where_extra="AND o.kind = 'person'")
-    out["tier"] = counts("tier", "o.tier", where_extra="AND o.kind = 'person'")
-    out["region"] = counts("region", "o.region")
-    out["loc"] = [[v, n] for v, n in counts("loc", "o.loc_id", limit=60)]
+    # A facet counts with every filter except its own. Facets whose field isn't filtered share the
+    # same WHERE, so they come from one grouped pass; only filtered fields need a pass of their own.
+    cols = {"kind": "o.kind", "fn": "o.fn", "tier": "o.tier", "region": "o.region", "loc": "o.loc_id", "org": "o.org_root"}
+    limits = {"loc": 60, "org": 60}
+    filtered = {_facet_field(f) for _, _, f in c.where}
+    shared = [k for k in cols if k not in filtered]
+    tallies: dict[str, Counter] = {k: Counter() for k in cols}
+    if shared:
+        w, prm = c.sql(has_fts=has_fts)
+        sel = ", ".join(cols[k] for k in shared)
+        for r in conn.execute(f"SELECT o.kind AS _k, {sel}, count(*) FROM objects o WHERE {w} GROUP BY {', '.join(cols[k] for k in dict.fromkeys(['kind'] + shared))}", prm):
+            n = r[-1]
+            for i, k in enumerate(shared, start=1):
+                if k in ("fn", "tier") and r[0] != "person":
+                    continue
+                tallies[k][r[i]] += n
+    for k in cols:
+        if k in shared or k == "org":      # a filtered unit facet drills into children below
+            continue
+        w, prm = c.sql(skip_field=k, has_fts=has_fts)
+        extra = "AND o.kind = 'person'" if k in ("fn", "tier") else ""
+        tallies[k] = Counter(dict(conn.execute(f"SELECT {cols[k]}, count(*) FROM objects o WHERE {w} {extra} GROUP BY 1", prm).fetchall()))
+    roots = tallies.pop("org")
+    for k in tallies:
+        out[k] = [[v, n] for v, n in tallies[k].most_common() if v not in (None, "")][:limits.get(k, 40)]
     names = {r["id"]: (r["name"], r["approx"]) for r in conn.execute("SELECT id, name, approx FROM locations")}
     out["loc"] = [[v, names.get(v, (v, 0))[0], n, names.get(v, (v, 0))[1]] for v, n in out["loc"]]
     # org facet drills: children of the selected org, else top-level units
@@ -157,19 +196,22 @@ def facets(ctx, p, b):
         kids = conn.execute("SELECT id, name, lft, rgt FROM orgs WHERE parent = ? ORDER BY sort", (parent,)).fetchall()
         prow = conn.execute("SELECT id, name, parent, lft FROM orgs WHERE id = ?", (parent,)).fetchone()
         w2, prm2 = c.sql(has_fts=has_fts)
+        # one pass: matches per office position, then each child's range adds up its subtree
+        by_lft = conn.execute(f"SELECT o.org_lft, count(*) FROM objects o WHERE {w2} GROUP BY 1", prm2).fetchall()
         items = []
         for k in kids:
-            n = conn.execute(f"SELECT count(*) FROM objects o WHERE {w2} AND o.org_lft BETWEEN ? AND ?",
-                             prm2 + [k["lft"], k["rgt"]]).fetchone()[0]
+            n = sum(c_ for l_, c_ in by_lft if l_ is not None and k["lft"] <= l_ <= k["rgt"])
             if n:
                 items.append([k["id"], k["name"], n])
-        direct = conn.execute(f"SELECT count(*) FROM objects o WHERE {w2} AND o.org_lft = ?", prm2 + [prow["lft"]]).fetchone()[0]
+        direct = sum(c_ for l_, c_ in by_lft if l_ == prow["lft"])
         out["org"] = {"parent": dict(prow), "items": items, "direct": direct}
     else:
-        rows = conn.execute(
-            f"SELECT r.id, r.name, count(*) AS n FROM objects o JOIN orgs r ON r.depth = 0 AND o.org_lft BETWEEN r.lft AND r.rgt "
-            f"WHERE {w} GROUP BY r.id ORDER BY n DESC LIMIT 60", prm).fetchall()
-        out["org"] = {"parent": None, "items": [[r["id"], r["name"], r["n"]] for r in rows]}
+        if "org" not in shared:
+            roots = Counter(dict(conn.execute(f"SELECT o.org_root, count(*) FROM objects o WHERE {w} GROUP BY 1", prm).fetchall()))
+        top = [(k, n) for k, n in roots.most_common() if k][:60]
+        names = dict(conn.execute(f"SELECT id, name FROM orgs WHERE id IN ({','.join('?' * len(top))})",
+                                  [k for k, _ in top]).fetchall()) if top else {}
+        out["org"] = {"parent": None, "items": [[k, names.get(k, k), n] for k, n in top]}
     return out
 
 
@@ -232,7 +274,8 @@ def obj(ctx, p, b):
             "WHERE m.group_id = ? ORDER BY x.org_lft, x.leader DESC, x.level DESC LIMIT 400", (o["id"],))]
         mb = o["extra"].get("ManagedBy")
         if mb:
-            owner = conn.execute("SELECT key, name, rank, title FROM objects WHERE lower(dn) = lower(?) OR lower(email) = lower(?)",
+            owner = conn.execute("SELECT key, name, rank, title FROM objects WHERE dn = ? COLLATE NOCASE "
+                                 "UNION ALL SELECT key, name, rank, title FROM objects WHERE email = ? COLLATE NOCASE LIMIT 1",
                                  (mb, mb)).fetchone()
             o["owner"] = rowdict(owner) if owner else {"name": mb}
     o["history"] = [rowdict(x) for x in conn.execute(
@@ -279,10 +322,10 @@ def org(ctx, p, b):
     sub = "o.org_lft BETWEEN ? AND ?"
     o["by_loc"] = [rowdict(x) for x in conn.execute(
         f"SELECT o.loc_id AS id, l.name, l.tz, l.approx, count(*) AS n FROM objects o LEFT JOIN locations l ON l.id = o.loc_id "
-        f"WHERE {sub} AND o.kind = 'person' GROUP BY o.loc_id ORDER BY n DESC LIMIT 20", (lft, rgt))]
-    o["by_cat"] = dict(conn.execute(f"SELECT category, count(*) FROM objects o WHERE {sub} AND kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
-    o["by_tier"] = dict(conn.execute(f"SELECT tier, count(*) FROM objects o WHERE {sub} AND kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
-    o["by_fn"] = dict(conn.execute(f"SELECT fn, count(*) FROM objects o WHERE {sub} AND kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
+        f"WHERE {sub} AND +o.kind = 'person' GROUP BY o.loc_id ORDER BY n DESC LIMIT 20", (lft, rgt))]
+    o["by_cat"] = dict(conn.execute(f"SELECT category, count(*) FROM objects o WHERE {sub} AND +kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
+    o["by_tier"] = dict(conn.execute(f"SELECT tier, count(*) FROM objects o WHERE {sub} AND +kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
+    o["by_fn"] = dict(conn.execute(f"SELECT fn, count(*) FROM objects o WHERE {sub} AND +kind = 'person' GROUP BY 1", (lft, rgt)).fetchall())
     snap = ctx.latest_snap(conn)
     o["changes"] = dict(conn.execute(
         "SELECT type, count(*) FROM events WHERE snap = ? AND kind = 'person' AND (org_id = ? OR org_id LIKE ?) GROUP BY type",
@@ -343,8 +386,13 @@ def orgs_children(ctx, p, b):
     pid = p.get("parent") or None
     q = (p.get("q") or "").strip()
     if q:
+        # spacing and punctuation don't matter: "meridian grp" finds "MERIDIAN-GRP/S2"
+        # only the highest match in each chain: offices whose parent already matches are reached by expanding it
+        norm = lambda col: f"replace(replace(replace(replace(upper({col}), ' ', ''), '-', ''), '_', ''), '.', '')"
+        needle = "%" + "".join(ch for ch in q.upper() if ch not in " -_.%") + "%"
         rows = conn.execute("SELECT id, name, parent, kind, fn, people, depth, (SELECT count(*) FROM orgs g WHERE g.parent = orgs.id) AS kids "
-                            "FROM orgs WHERE id LIKE ? OR name LIKE ? ORDER BY people DESC LIMIT 60", (f"%{q}%", f"{q}%")).fetchall()
+                            f"FROM orgs WHERE {norm('id')} LIKE ? AND (parent IS NULL OR {norm('parent')} NOT LIKE ?) "
+                            "ORDER BY people DESC LIMIT 150", (needle, needle)).fetchall()
     elif pid is None:
         rows = conn.execute("SELECT id, name, parent, kind, fn, people, depth, (SELECT count(*) FROM orgs g WHERE g.parent = orgs.id) AS kids "
                             "FROM orgs WHERE parent IS NULL ORDER BY people DESC").fetchall()
@@ -359,25 +407,30 @@ def locations(ctx, p, b):
     conn = need(ctx)
     c = compile_query(conn, p.get("q", ""), ctx.latest_snap(conn))
     w, prm = c.sql(has_fts=dbm.has_fts5())
-    rows = conn.execute(
-        f"SELECT l.*, count(o.id) AS n, sum(o.kind = 'person') AS np FROM objects o JOIN locations l ON l.id = o.loc_id "
-        f"WHERE {w} GROUP BY l.id ORDER BY n DESC", prm).fetchall()
-    mix = defaultdict(dict)
-    for r in conn.execute(f"SELECT o.loc_id, o.fn, count(*) FROM objects o WHERE {w} AND o.kind = 'person' GROUP BY 1, 2", prm):
-        mix[r[0]][r[1] or ""] = r[2]
-    units = defaultdict(list)
-    for r in conn.execute(
-            f"SELECT o.loc_id, g.site, count(*) AS n FROM objects o JOIN orgs g ON g.id = o.org_id "
-            f"WHERE {w} GROUP BY 1, 2 ORDER BY n DESC", prm):
-        if len(units[r[0]]) < 5:
-            units[r[0]].append([r[1], r[2]])
+    # one grouped pass: per site, per office, per function, people or not
+    site_of = dict(conn.execute("SELECT id, site FROM orgs").fetchall())
+    n, np_, mix, per = Counter(), Counter(), defaultdict(Counter), defaultdict(Counter)
+    unplaced = 0
+    for lid, oid, fn, person, k in conn.execute(
+            f"SELECT o.loc_id, o.org_id, o.fn, o.kind = 'person', count(*) FROM objects o WHERE {w} GROUP BY 1, 2, 3, 4", prm):
+        if not lid:
+            unplaced += k
+            continue
+        n[lid] += k
+        if person:
+            np_[lid] += k
+            mix[lid][fn or ""] += k
+        if oid and oid in site_of:
+            per[lid][site_of[oid]] += k
     out = []
-    for r in rows:
+    for r in conn.execute("SELECT * FROM locations"):
+        if r["id"] not in n:
+            continue
         d = rowdict(r)
-        d["mix"] = mix.get(r["id"], {})
-        d["units"] = units.get(r["id"], [])
+        d.update(n=n[r["id"]], np=np_[r["id"]], mix=dict(mix[r["id"]]),
+                 units=[[u, k] for u, k in per[r["id"]].most_common(5)])
         out.append(d)
-    unplaced = conn.execute(f"SELECT count(*) FROM objects o WHERE {w} AND (o.loc_id = '' OR o.loc_id IS NULL)", prm).fetchone()[0]
+    out.sort(key=lambda d: -d["n"])
     return {"locations": out, "unplaced": unplaced}
 
 
@@ -469,21 +522,22 @@ def quality(ctx, p, b):
         issues.append({"id": iid, "label": label, "count": n, "query": query, "severity": sev, "help": help_})
 
     one = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
-    add("no-email", "People without an email address", one(f"SELECT count(*) FROM objects WHERE {P} AND email = ''"),
-        "kind:person missing:email", "warn")
-    add("no-phone", "People without a phone", one(f"SELECT count(*) FROM objects WHERE {P} AND phone = '' AND dsn = '' AND mobile = ''"),
-        "kind:person missing:phone", "info")
-    add("no-org", "People with no Department / org", one(f"SELECT count(*) FROM objects WHERE {P} AND org_id = ''"),
+    # every per-person count in one pass over the table
+    pc = conn.execute(f"SELECT sum(email = ''), sum(phone = '' AND dsn = '' AND mobile = ''), sum(org_id = ''), "
+                      f"sum(grade = ''), sum(disabled = 1) FROM objects WHERE +{P}").fetchone()
+    pc = [n or 0 for n in pc]
+    add("no-email", "People without an email address", pc[0], "kind:person missing:email", "warn")
+    add("no-phone", "People without a phone", pc[1], "kind:person missing:phone", "info")
+    add("no-org", "People with no Department / org", pc[2],
         "kind:person missing:org", "warn", "Department is empty and the display name carries no org path.")
     add("no-loc", "Objects with no location at all", one("SELECT count(*) FROM objects WHERE loc_id = ''"), "missing:loc", "warn",
         "No installation OU, office, city or country matched anything.")
     add("approx", "Objects placed approximately (state / country centroid)",
         one("SELECT count(*) FROM objects WHERE loc_id IN (SELECT id FROM locations WHERE approx = 1)"), "is:approx", "info",
         "Add the site to data/sites.json with coordinates, or alias it to a known site under Rules.")
-    add("no-rank", "People whose rank / grade could not be read", one(f"SELECT count(*) FROM objects WHERE {P} AND grade = ''"),
-        "kind:person missing:rank", "info")
+    add("no-rank", "People whose rank / grade could not be read", pc[3], "kind:person missing:rank", "info")
     add("dup-email", "Email addresses shared by more than one object",
-        one("SELECT count(*) FROM (SELECT email FROM objects WHERE email <> '' GROUP BY lower(email) HAVING count(*) > 1)"),
+        one("SELECT count(*) FROM (SELECT email FROM objects WHERE email <> '' GROUP BY email COLLATE NOCASE HAVING count(*) > 1)"),
         "", "warn")
     add("mgr-unresolved", "Manager set but not found in this export",
         one("SELECT count(*) FROM objects WHERE manager_dn <> '' AND manager_key IS NULL"), "", "info",
@@ -491,12 +545,12 @@ def quality(ctx, p, b):
     add("no-leader", "Orgs (3+ people) with no title-based leader",
         one("SELECT count(*) FROM orgs WHERE people >= 3 AND IFNULL(leader_by, '') <> 'title' AND direct > 0"), "", "info",
         "Leader falls back to the most senior member.")
-    add("disabled", "Disabled accounts included", one(f"SELECT count(*) FROM objects WHERE {P} AND disabled = 1"), "is:disabled", "info")
+    add("disabled", "Disabled accounts included", pc[4], "is:disabled", "info")
     approx = [rowdict(r) for r in conn.execute(
         "SELECT id, name, full, region, country, state, people, total, ou FROM locations WHERE approx = 1 ORDER BY total DESC LIMIT 50")]
     dups = [rowdict(r) for r in conn.execute(
         "SELECT lower(email) AS email, count(*) AS n, group_concat(name, ' · ') AS names FROM objects WHERE email <> '' "
-        "GROUP BY lower(email) HAVING count(*) > 1 ORDER BY n DESC LIMIT 30")]
+        "GROUP BY email COLLATE NOCASE HAVING count(*) > 1 ORDER BY n DESC LIMIT 30")]
     leaderless = [rowdict(r) for r in conn.execute(
         "SELECT o.id, o.people, ob.name AS senior, ob.rank FROM orgs o LEFT JOIN objects ob ON ob.key = o.leader_key "
         "WHERE o.people >= 3 AND IFNULL(o.leader_by, '') <> 'title' AND o.direct > 0 ORDER BY o.people DESC LIMIT 30")]
@@ -504,8 +558,22 @@ def quality(ctx, p, b):
         "SELECT id, parent, inferred FROM orgs WHERE inferred <> '' AND inferred <> 'office symbol' ORDER BY inferred, id LIMIT 100")]
     snap = conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
     cols = json.loads(snap["columns"]) if snap and snap["columns"] else {}
+    stored = dict(conn.execute("SELECT k, v FROM meta WHERE k IN ('folds', 'fold_suggestions')").fetchall())
+    folds = json.loads(stored.get("folds") or "[]")
+    suggestions = json.loads(stored.get("fold_suggestions") or "[]")
     return {"issues": issues, "approx": approx, "dups": dups, "leaderless": leaderless, "inferred": inferred,
-            "columns": cols, "snapshot": rowdict(snap) if snap else None}
+            "columns": cols, "snapshot": rowdict(snap) if snap else None,
+            "folds": _fold_groups(folds)[:150], "foldCount": len(folds),
+            "suggestions": suggestions}
+
+
+def _fold_groups(folds: list[dict]) -> list[dict]:
+    """Merged spellings by the unit they were filed under, most records first."""
+    by = defaultdict(list)
+    for f in folds:
+        by[f["into"]].append(f)
+    out = [{"into": k, "n": sum(f["n"] for f in v), "variants": sorted(v, key=lambda f: -f["n"])} for k, v in by.items()]
+    return sorted(out, key=lambda g: -g["n"])
 
 
 # ---------------------------------------------------------------- export
@@ -668,7 +736,7 @@ def run_ingest_job(ctx: Ctx, source: str, work) -> bool:
         try:
             paths = work(log)
             for path in paths if isinstance(paths, list) else [paths]:
-                ctx.job["result"] = ing.ingest(path, ctx.data_dir, log=log)
+                ctx.job["result"] = ing.ingest(path, ctx.data_dir, log=log, before_swap=ctx.pool.drain)
         except Exception as e:  # noqa: BLE001 — surface any failure to the UI
             ctx.job["error"] = f"{type(e).__name__}: {e}"
             log(traceback.format_exc(limit=3))
@@ -726,6 +794,7 @@ def reset(ctx, p, b):
     """Drop the directory and its history (e.g. after trying demo data). Team notes & lists are kept."""
     if ctx.job["running"]:
         return {"error": "an ingest is running"}
+    ctx.pool.drain()
     for name in ("org.db", "org.db-wal", "org.db-shm"):
         f = ctx.data_dir / name
         if f.exists():

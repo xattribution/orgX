@@ -1,7 +1,7 @@
 /* Find: the main screen. Search as you type, the top match's card opens beside the results,
    arrows move through them. Questions ("who handles SATCOM at Alder?") are answered in place.
    A table mode keeps the dense roster for bulk work. */
-import { $, esc, attr, kindShort, shortOrg, debounce, fmt, copy, say, modal, tokens, toggleToken, hasToken, setToken, removeTokenAt, download, icon, menu, info, plainName } from "../ui.js";
+import { $, esc, attr, kindShort, shortOrg, debounce, fmt, copy, say, modal, tokens, toggleToken, hasToken, setToken, removeTokenAt, download, icon, menu, info, plainName, clearable } from "../ui.js";
 import { api, post, apiUrl, state, settings, isStarred, toggleStar } from "../store.js";
 import { ltHtml } from "../time.js";
 import { setParams, openDrawer } from "../app.js";
@@ -15,7 +15,7 @@ const FLAGS = [["is", "new", "New since last update"], ["is", "moved", "Moved"],
 const QUESTION = /^(who|whom|where|which|poc|need|contact|is there)\b|\?$|\bpoc\b/i;
 
 let root, find, q = "", sort = "", mode = "list", total = 0, pages = new Map(), sel = new Set(), lastIdx = null, reqId = 0;
-let scroller, space, activeKey = "", userPicked = false, askData = null, lastFacets = null, homeRows = null;
+let scroller, space, activeKey = "", userPicked = false, askData = null, lastFacets = null, homeRows = null, syncFq = () => {};
 
 const rowH = () => (mode === "table" ? ROW_TABLE : ROW_LIST);
 const textPart = (s) => tokens(s).filter((t) => !t.field && !t.neg).map((t) => t.raw).join(" ");
@@ -47,10 +47,12 @@ export default {
     scroller = $("#rlist", el);
     space = $("#vspace", el);
     const input = $("#fq", el);
+    syncFq = clearable(input, () => setQ(joinQ("")));
     input.addEventListener("input", debounce(() => setQ(joinQ(input.value), { typing: true }), 160));
     input.addEventListener("keydown", (e) => {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); move(e.key === "ArrowDown" ? 1 : -1); }
       if (e.key === "Enter") { e.preventDefault(); normalizeInput(); }
+      if (e.key === "Escape" && input.value) { e.preventDefault(); e.stopPropagation(); input.value = ""; syncFq(); setQ(joinQ("")); }
     });
     scroller.addEventListener("scroll", () => requestAnimationFrame(paint));
     window.addEventListener("resize", paintSoon);
@@ -71,7 +73,7 @@ export default {
     if (nq !== q || ns !== sort || nm !== mode) {
       q = nq; sort = ns; mode = nm;
       const input = $("#fq", root);
-      if (textPart(q) !== input.value.trim()) input.value = textPart(q);   // came from a link or the address bar, not typing
+      if (textPart(q) !== input.value.trim()) { input.value = textPart(q); syncFq(); }   // came from a link or the address bar, not typing
       reload();
     } else paint();
   },
@@ -98,6 +100,7 @@ function normalizeInput() {
   const input = $("#fq", root);
   const full = joinQ(input.value);
   input.value = textPart(full);       // typed filters such as base:Alder become chips
+  syncFq();
   setQ(full);
 }
 const hasFilters = () => !!q.trim();
@@ -455,7 +458,7 @@ function onBarClick(e) {
   if (k) return setQ(setToken(q, "kind", k.dataset.kind));
   const rm = e.target.closest("[data-rm]");
   if (rm) return setQ(removeTokenAt(q, +rm.dataset.rm));
-  if (e.target.closest("[data-clear]")) { $("#fq", root).value = ""; setQ(""); }
+  if (e.target.closest("[data-clear]")) { $("#fq", root).value = ""; syncFq(); setQ(""); }
 }
 function onBarChange(e) {
   const s = e.target.closest("[data-fsel]");

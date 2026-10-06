@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
+
+SCHEMA_VERSION = 2       # bump when a directory built by an older version needs upgrade() before use
 
 OBJECT_COLS = [
     "key", "kind", "display", "name", "sort_name", "first", "last", "mi", "rank", "grade", "level",
@@ -39,16 +42,17 @@ CREATE TABLE objects (
   email TEXT, upn TEXT, sam TEXT, loc_id TEXT, region TEXT, country TEXT, ou_path TEXT, dn TEXT,
   domain TEXT, career TEXT, fn TEXT, fns TEXT, leader INTEGER, manager_dn TEXT, disabled INTEGER,
   hidden INTEGER, created TEXT, changed TEXT, description TEXT, extra TEXT,
-  manager_key TEXT, org_lft INTEGER
+  manager_key TEXT, org_lft INTEGER, org_root TEXT
 );
 CREATE TABLE stage_members (group_key TEXT, ref TEXT);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS ou_stats (depth INTEGER, value TEXT, n INTEGER, cities TEXT, PRIMARY KEY (depth, value));
 CREATE TABLE members (group_id INTEGER, member_id INTEGER, PRIMARY KEY (group_id, member_id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS object_fns (fn TEXT, object_id INTEGER, PRIMARY KEY (fn, object_id)) WITHOUT ROWID;
 CREATE TABLE orgs (
   id TEXT PRIMARY KEY, name TEXT, parent TEXT, depth INTEGER, kind TEXT, fn TEXT,
   direct INTEGER, total INTEGER, people INTEGER, leader_key TEXT, leader_by TEXT,
-  loc_id TEXT, locs INTEGER, inferred TEXT, lft INTEGER, rgt INTEGER, sort INTEGER, site TEXT
+  loc_id TEXT, locs INTEGER, inferred TEXT, lft INTEGER, rgt INTEGER, sort INTEGER, site TEXT, root TEXT
 );
 CREATE TABLE locations (
   id TEXT PRIMARY KEY, name TEXT, full TEXT, lat REAL, lon REAL, tz TEXT, country TEXT, state TEXT,
@@ -56,22 +60,31 @@ CREATE TABLE locations (
 );
 """
 
+# Each index serves a query the UI makes on every visit; the covering ones let SQLite answer
+# counts and group-bys from the index alone instead of visiting a million rows.
 INDEXES = """
-CREATE INDEX ob_kind ON objects(kind, sort_name);
-CREATE INDEX ob_org ON objects(org_lft);
-CREATE INDEX ob_orgid ON objects(org_id);
-CREATE INDEX ob_loc ON objects(loc_id);
-CREATE INDEX ob_fn ON objects(fn);
-CREATE INDEX ob_level ON objects(level);
-CREATE INDEX ob_email ON objects(email);
-CREATE INDEX ob_dn ON objects(dn);
-CREATE INDEX ob_mgr ON objects(manager_key);
-CREATE INDEX ob_region ON objects(region);
-CREATE INDEX ob_country ON objects(country);
-CREATE INDEX ob_digits ON objects(phone_digits);
-CREATE INDEX org_parent ON orgs(parent, sort);
-CREATE INDEX org_lft ON orgs(lft);
-CREATE INDEX mem_member ON members(member_id);
+CREATE INDEX IF NOT EXISTS ob_kind ON objects(kind, sort_name);
+CREATE INDEX IF NOT EXISTS ob_org ON objects(org_lft, kind, category, tier, fn, loc_id);
+CREATE INDEX IF NOT EXISTS ob_orgid ON objects(org_id, kind);
+CREATE INDEX IF NOT EXISTS ob_root ON objects(org_root, kind);
+CREATE INDEX IF NOT EXISTS ob_loc ON objects(loc_id, kind, fn, category, org_id);
+CREATE INDEX IF NOT EXISTS ob_kfn ON objects(kind, fn);
+CREATE INDEX IF NOT EXISTS ob_facet ON objects(kind, category, tier, fn, region, loc_id, org_root, level, org_lft, country, fns);
+CREATE INDEX IF NOT EXISTS ob_ktier ON objects(kind, tier);
+CREATE INDEX IF NOT EXISTS ob_senior ON objects(kind, level DESC, leader DESC, sort_name);
+CREATE INDEX IF NOT EXISTS ob_leader ON objects(kind, leader) WHERE leader > 0;
+CREATE INDEX IF NOT EXISTS ob_smart ON objects(CASE kind WHEN 'person' THEN 0 WHEN 'orgbox' THEN 1 WHEN 'group' THEN 2 ELSE 3 END,
+  org_lft, leader DESC, level DESC, sort_name);
+CREATE INDEX IF NOT EXISTS ob_level ON objects(level);
+CREATE INDEX IF NOT EXISTS ob_email ON objects(email COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS ob_dn ON objects(dn COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS ob_mgr ON objects(manager_key);
+CREATE INDEX IF NOT EXISTS ob_region ON objects(region);
+CREATE INDEX IF NOT EXISTS ob_country ON objects(country);
+CREATE INDEX IF NOT EXISTS ob_digits ON objects(phone_digits);
+CREATE INDEX IF NOT EXISTS org_parent ON orgs(parent, sort);
+CREATE INDEX IF NOT EXISTS org_lft ON orgs(lft);
+CREATE INDEX IF NOT EXISTS mem_member ON members(member_id);
 """
 
 FTS = """
@@ -108,6 +121,14 @@ def has_fts5() -> bool:
         return False
 
 
+def tune(conn: sqlite3.Connection) -> None:
+    """Read settings for a large directory: map the file instead of copying pages through a 2 MB
+    cache, keep sorts in memory."""
+    conn.execute("PRAGMA mmap_size = 4294967296")
+    conn.execute("PRAGMA cache_size = -131072")
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+
 def connect(data_dir: Path, readonly: bool = True) -> sqlite3.Connection | None:
     db = data_dir / "org.db"
     if not db.exists():
@@ -115,10 +136,64 @@ def connect(data_dir: Path, readonly: bool = True) -> sqlite3.Connection | None:
     uri = f"file:{db}?mode=ro" if readonly else str(db)
     conn = sqlite3.connect(uri, uri=readonly, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    tune(conn)
     ann = data_dir / "annotations.db"
     init_annotations(data_dir)
     conn.execute("ATTACH DATABASE ? AS ann", (str(ann),))
     return conn
+
+
+def identity(path: Path) -> tuple:
+    """Changes when the file is replaced (a new ingest) or written (on-the-fly lookups, notes)."""
+    try:
+        st = path.stat()
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ()
+
+
+class Pool:
+    """Open read connections kept between requests, so each one starts with a warm page cache and
+    parsed schema. A connection belongs to one file: when an ingest replaces org.db, connections
+    to the old file are closed as they come back (and drain() closes idle ones before the swap,
+    which Windows needs before it will replace an open file)."""
+
+    def __init__(self, data_dir: Path, size: int = 8):
+        self.data_dir = data_dir
+        self.size = size
+        self.idle: list[tuple[int, sqlite3.Connection]] = []
+        self.lock = threading.Lock()
+
+    def _ino(self) -> int:
+        try:
+            return (self.data_dir / "org.db").stat().st_ino
+        except OSError:
+            return -1
+
+    def get(self) -> tuple[int, sqlite3.Connection] | None:
+        ino = self._ino()
+        with self.lock:
+            while self.idle:
+                i, c = self.idle.pop()
+                if i == ino:
+                    return i, c
+                c.close()
+        c = connect(self.data_dir)
+        return (ino, c) if c else None
+
+    def put(self, item: tuple[int, sqlite3.Connection]) -> None:
+        ino, c = item
+        with self.lock:
+            if ino == self._ino() and len(self.idle) < self.size:
+                self.idle.append(item)
+                return
+        c.close()
+
+    def drain(self) -> None:
+        with self.lock:
+            for _, c in self.idle:
+                c.close()
+            self.idle.clear()
 
 
 # Columns added after the first release; migrated in place (lists became shareable groups).

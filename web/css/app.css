@@ -129,6 +129,17 @@ body[data-view="dir"] .head .search { visibility: hidden; }
 #omni-input { width: 100%; height: 36px; padding: 0 64px 0 12px; background: var(--paper); border: 1px solid var(--rule); border-radius: var(--r); outline: none; }
 #omni-input:focus { border-color: var(--accent); background: var(--surface); }
 #omni-input::-webkit-search-cancel-button { display: none; }
+/* clear button inside search fields (ui.clearable) */
+.clr { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 26px; height: 26px; padding: 0; border: 0; border-radius: var(--r);
+       background: none; color: var(--muted); cursor: pointer; display: grid; place-items: center; }
+.clr:hover { color: var(--ink); background: var(--sunk); }
+.clr[hidden] { display: none; }
+.filled > kbd { display: none; }
+.fwrap { position: relative; display: block; }
+.variants { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.fwrap > .input { width: 100%; height: 32px; padding-right: 32px; }
+.fwrap > .input::-webkit-search-cancel-button { display: none; }
+.bigsearch > .clr { right: 10px; }
 .search > kbd { position: absolute; right: 10px; }
 .me { position: relative; margin-left: 8px; }
 .me > button { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--r); background: none; cursor: pointer; color: var(--ink-2); white-space: nowrap; }
@@ -401,6 +412,7 @@ svg.i.tiny { width: 12px; height: 12px; vertical-align: -1px; color: var(--ink-2
 /* ---------------------------------------------------------------- the card (person, office, base) */
 .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(520px, 100vw); background: var(--surface); z-index: 40; display: flex; flex-direction: column; }
 .drawer[hidden] { display: none; }
+.form [hidden] { display: none; }
 body > .drawer { box-shadow: var(--shadow); }
 .find .drawer { position: static; width: auto; border-left: 1px solid var(--rule); z-index: auto; min-height: 0; }
 .dr-top { display: flex; align-items: center; gap: 8px; padding: 10px 16px 0 24px; font-size: 12px; color: var(--muted); }

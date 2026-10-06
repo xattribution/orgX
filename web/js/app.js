@@ -243,6 +243,9 @@ async function boot() {
   window.addEventListener("hashchange", () => { omni.close(); route(); });
   $("#clocks").onclick = openClocks;
   window.addEventListener("orgx:settings", () => { renderClocks(); renderMe(); });
+  let liveErr = "";
+  window.addEventListener("orgx:live-error", (e) => { if (e.detail !== liveErr) say(`Couldn't look that up in the directory: ${esc(e.detail)}`); liveErr = e.detail; });
+  window.addEventListener("orgx:live", () => { liveErr = ""; if (state.meta?.empty) refreshMeta(); });
   setInterval(renderClocks, 15_000);
   setInterval(async () => {
     try {

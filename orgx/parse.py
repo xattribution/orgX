@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from . import reference as ref
 
@@ -97,6 +98,7 @@ def resolve_rank(token: str, service: str = "") -> tuple[str, str]:
     return t, opts[-1][0]
 
 
+@lru_cache(maxsize=65536)
 def smart_case(s: str) -> str:
     """'MCDONALD-O'BRIEN' → 'McDonald-O'Brien'. Leaves mixed-case input alone."""
     if not s or not s.isupper():
@@ -170,6 +172,8 @@ def parse_display(display: str) -> dict:
 # ---------------------------------------------------------------- DN / OU
 def split_dn(dn: str) -> list[tuple[str, str]]:
     """'CN=DOE\\, JANE,OU=Users,DC=x' → [('CN','DOE, JANE'), ('OU','Users'), ('DC','x')]."""
+    if "\\" not in dn:          # no escapes: a plain split is exact and much faster
+        return [(k.strip().upper(), v.strip()) for k, _, v in (p.partition("=") for p in dn.split(",")) if _]
     parts, buf, esc = [], [], False
     for ch in dn:
         if esc:
@@ -195,10 +199,21 @@ def split_dn(dn: str) -> list[tuple[str, str]]:
 def ou_path(dn: str = "", ou: str = "") -> tuple[list[str], str]:
     """Return (OUs root→leaf, domain). Accepts a DN or a canonical 'domain/OU/OU[/CN]' path."""
     if dn and "=" in dn:
-        parts = split_dn(dn)
-        ous = [v for k, v in parts if k == "OU"][::-1]
-        dom = ".".join(v for k, v in parts if k == "DC")
-        return ous, dom
+        # the object's own RDN, then its parent path (shared by everyone in that OU, so cached)
+        i, esc = 0, False
+        for i, ch in enumerate(dn):
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == ",":
+                break
+        else:
+            i = len(dn)
+        ous, dom = _parent_path(dn[i + 1:])
+        if dn[:3].upper() == "OU=":
+            return list(ous) + [split_dn(dn[:i])[0][1]], dom
+        return list(ous), dom
     src = ou or dn
     if src and "=" in src:
         return ou_path(src)
@@ -208,6 +223,12 @@ def ou_path(dn: str = "", ou: str = "") -> tuple[list[str], str]:
         segs = segs[1:] if dom else segs
         return segs, dom
     return [], ""
+
+
+@lru_cache(maxsize=200_000)
+def _parent_path(parent: str) -> tuple[tuple[str, ...], str]:
+    parts = split_dn(parent) if parent else []
+    return tuple(v for k, v in parts if k == "OU")[::-1], ".".join(v for k, v in parts if k == "DC")
 
 
 def ou_kind(ous: list[str]) -> str:
@@ -316,12 +337,17 @@ def career_function(career: str) -> str:
     return best
 
 
-def classify_functions(title: str, path: list[str], career: str, keywords: dict[str, list[str]]) -> list[str]:
+def path_scores(path) -> dict[str, float]:
     score: dict[str, float] = {}
     for depth, seg in enumerate(path):
         fn = code_function(seg)
         if fn:
             score[fn] = score.get(fn, 0) + (1.5 + depth)   # deeper org codes are more specific
+    return score
+
+
+def title_scores(title: str, keywords: dict[str, list[str]]) -> dict[str, float]:
+    score: dict[str, float] = {}
     t = f" {(title or '').lower()} "
     for fn, words in keywords.items():
         hits = 0
@@ -331,11 +357,22 @@ def classify_functions(title: str, path: list[str], career: str, keywords: dict[
             if (len(w) <= 4 and re.search(rf"\b{re.escape(w)}\b", t)) or (len(w) > 4 and w in t):
                 hits += 1
         if hits:
-            score[fn] = score.get(fn, 0) + 2 * min(hits, 2)
-    cf = career_function(career)
-    if cf:
-        score[cf] = score.get(cf, 0) + 1.5
+            score[fn] = 2 * min(hits, 2)
+    return score
+
+
+def combine_scores(*parts: dict[str, float], career_fn: str = "") -> list[str]:
+    score: dict[str, float] = {}
+    for part in parts:
+        for fn, v in part.items():
+            score[fn] = score.get(fn, 0) + v
+    if career_fn:
+        score[career_fn] = score.get(career_fn, 0) + 1.5
     return [fn for fn, s in sorted(score.items(), key=lambda kv: -kv[1]) if s >= 1.5]
+
+
+def classify_functions(title: str, path: list[str], career: str, keywords: dict[str, list[str]]) -> list[str]:
+    return combine_scores(path_scores(path), title_scores(title, keywords), career_fn=career_function(career))
 
 
 # ---------------------------------------------------------------- misc

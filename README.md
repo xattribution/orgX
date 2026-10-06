@@ -79,8 +79,33 @@ Try it from a terminal first:
 
 It pulls every mail-enabled object (users, org boxes, groups, contacts, rooms) with
 OU path, manager, membership (ranged, so large DLs are complete) and the Exchange
-recipient type. Output streams to CSV, so memory stays flat on very large directories.
+recipient type. Each object is written to the CSV as it arrives (the directory searcher's
+result cache is off), so memory stays flat and the file grows steadily on very large
+directories.
 `-SearchBase` takes several bases separated by `;`. `-SkipMembers` makes a quick pass.
+
+### On the fly
+
+Set **Mode** to *On the fly* to skip the full export. ORGX then looks things up as you
+go and keeps what it finds, so the local directory grows around what you actually use:
+
+- **Search**: the words are resolved the way the Outlook address book does (`anr`), and
+  an OU whose name starts with them (a site) brings that OU's objects in.
+- **Open a person**: their manager and the manager's manager, their peers, their reports
+  and their reports' reports.
+- **Open a unit**: everyone whose department is that unit or below it.
+- **Open a base**: the site OU it was learned from.
+
+Results land in `data/org.db` with the same normalization as an export, and org trees,
+bases and the search index are rebuilt after each lookup. A lookup isn't repeated until
+**Look up again after** has passed. Scheduled full syncs pause in this mode; **Sync now**
+still runs one.
+
+The server keeps `tools/ADLookup.ps1 -Serve` running and sends it one JSON line per
+request (`search`, `dn`, `reports`, `dept`, `ous`, `ou`). Where PowerShell can't read
+stdin line by line, it runs the script once per request with `-Request <file>`. Both
+scripts share `tools/ADCommon.ps1`. To try the mode without a domain, point
+`ORGX_LIVE_CSV` at an export file; lookups are then answered from it.
 
 ### Who am I
 
@@ -107,7 +132,7 @@ The snapshot date is taken from a date in the file name (`gal_20260915.csv`,
 ### Columns
 
 Headers are matched case- and punctuation-insensitively. Both the Exchange/PowerShell
-names and raw LDAP names work. Columns it doesn't recognise are kept and shown
+names and raw LDAP names work. Columns it doesn't recognize are kept and shown
 under **All directory attributes**.
 
 | Field | Accepted headers |
@@ -143,10 +168,20 @@ they're kept even with "skip disabled" on. Service accounts are dropped.
 OU layout. On every ingest it reads the OU paths once and finds the level that holds sites:
 the depth whose values cover most objects, aren't container names (`Users`, `Groups`,
 `Resources`…) and each line up with one city. The level above becomes the region. Rules
-can pin the level instead. A site is placed by, in order: a matching entry in an optional
-local `data/sites.json` (your own coordinates, time zones and aliases; it never leaves your
-server) → `Office`/`City` text matching that list → its state or country centroid,
-approximately (dashed on the map and listed under **Quality**).
+can pin the level instead. Every OU at the site level is its own place; its coordinates come
+from, in order: a matching entry (name or alias) in an optional local `data/sites.json` (your own
+coordinates, time zones and aliases; it never leaves your server) → a listed site named in the
+OU, `Office` or `City` text, whose coordinates it borrows without merging into it → its state or
+country centroid, approximately (dashed on the map and listed under **Quality**).
+
+**Unit spellings.** A unit typed by many hands drifts: `MERIDIAN GROUP`, `MERIDIAN-GROUP`,
+`USMERIDIAN-GROUP`, `AU USSF MERIDIAN GROUP`. Before building, ORGX counts how each unit root is
+written and files spellings together when they differ only in case, spacing and punctuation,
+or when one is the other behind country or service tags and the bare name exists on its own
+(bare names under eight letters, such as `COMMAND`, never match). The spelling most people use
+is kept. Numbered sister units (`GROUP 2`, `GROUP 3`) stay apart. Spellings one letter apart
+are only suggested. **Quality** lists every merge with *Keep separate*, and the suggestions
+with *Merge*; both are saved as rules (`orgSeparate`, `orgAliases`) and applied on reload.
 
 **Org tree.** AD `Department` strings don't say who owns whom, so ORGX infers it,
 strongest evidence first:
@@ -272,6 +307,7 @@ Everything the UI does is a JSON call. Useful for scripts and bots:
 | `POST /api/group` · `/api/group/import` · `/api/resolve` | create/update/delete groups and members, import a share file, match a pasted list |
 | `GET /api/emails?q=\|keys=\|group=&style=&sep=&pick=&exclude=&batch=&field=` | email list batches, mail links, recipients |
 | `GET /api/whoami` · `/api/ad` · `POST /api/ad/test` · `/api/ad/sync` | identity, AD connector status, test bind, sync |
+| `GET /api/live` · `POST /api/live/search\|person\|unit\|site` (`{q}`, `{key}`, `{id}`) | on-the-fly status and lookups; each returns added/updated counts or `cached` |
 | `POST /api/note` · `/api/rules` | team notes, rules |
 
 ## Layout
@@ -288,13 +324,17 @@ orgx/
   groups.py            groups, share files, paste matching
   mail.py              email list builder
   adsync.py            whoami + AD connector (runs the PowerShell export)
+  live.py              on-the-fly lookups: lookup worker, upsert, rebuild
+  fold.py              drifted spellings of one unit folded together; near misses suggested
   api.py               JSON handlers
   reference.py         ranks, functions, kinds, topics, leadership
   rules.py · db.py     data/rules.json overlay · schema
 web/                   index.html, css/app.css, js/ (ES modules, no build step), fonts/ (Public Sans, IBM Plex Sans Condensed, Atkinson Hyperlegible Mono; OFL)
 tools/
-  Export-ADDirectory.ps1   AD → CSV (RSAT or ADSI, -Test)
-  make_synthetic.py        fictional AD-shaped demo data with churn (--scale, --snapshots)
+  Export-ADDirectory.ps1   AD → CSV, streamed (RSAT or ADSI, -Test)
+  ADLookup.ps1             targeted lookups for on-the-fly mode (-Serve, -Request)
+  ADCommon.ps1             shared searcher, columns and CSV writer
+  make_synthetic.py        fictional AD-shaped demo data with churn (--scale, --snapshots, --copies, --messy)
   build_geo.py             regenerates web/js/geo-data.js + data/centroids.json
 data/centroids.json    country centroids · data/sites.json (optional, local only) your site coordinates
 tests/                 python3 -m unittest discover -s tests   (or: python3 ingest.py --selftest)
@@ -312,12 +352,23 @@ Hyperlegible Mono, whose zero is slashed. Names read in natural order. Classific
 are left to the operating system.
 Every visual element has a reason in `DESIGN.md`.
 
-**Scale.** Ingest is linear, about 6 s per 37k rows (roughly 2.5–3 min per million),
-and builds into a temporary file that replaces the live database atomically, so the
-UI keeps serving during an import. On 37k people, searches take 5–25 ms, and
-facets, the map, routing and org pages take 80–230 ms. Full-scan aggregations
-grow linearly, so a million-object directory answers facets in a few seconds.
-Scoping by unit or location keeps it fast.
+**Scale.** Measured on a synthetic 875k-object directory (13k units, 226 sites, two snapshots):
+
+- **Ingest** takes about 2 minutes, with memory flat near 220 MB. Rows stream from the file in
+  batches. Values that repeat across a directory (titles, unit paths, OU paths, cities) are worked
+  out once. The build goes to a temporary file that replaces the live one atomically, so the UI
+  keeps serving during an import.
+- **Queries** read from indexes shaped to what each screen asks: unit ranges, sites, seniority,
+  the default order, function membership (a small side table) and a covering index for facets.
+  Each object stores its top-level unit for the unit facet. After every load, ORGX runs
+  `ANALYZE` so SQLite picks the narrow index instead of walking a million rows.
+- **Connections** are pooled and memory-map the file, so each request starts warm.
+- **Answers** are cached until the directory, notes or rules change. The first screens are worked
+  out in the background right after each load. Measured there: every call the UI makes is under
+  250 ms once warm; repeats take a few milliseconds; a broad filter seen for the first time
+  (all civilians, a function across every unit) takes up to about a second.
+- A directory built by an older version is upgraded in place the first time the server starts
+  (new columns, indexes and statistics), so it works without a reload.
 
 **Security.** There is no authentication built in. Run it on a trusted network, or put it
 behind a reverse proxy that handles CAC/SSO. Set `ORGX_UPLOAD=0` to restrict imports to

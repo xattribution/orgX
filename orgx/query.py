@@ -150,8 +150,11 @@ def compile_query(conn: sqlite3.Connection, q: str, latest_snap: int | None = No
             sql, params = f"o.country IN ({','.join('?' * len(cs))})", cs
         elif f in ("fn", "function"):
             fs = [FN_ALIAS.get(x.lower(), x.lower()) for x in vals]
-            sql = "(" + " OR ".join("(',' || o.fns || ',') LIKE ?" for _ in fs) + ")"
-            params = [f"%,{x},%" for x in fs]
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'object_fns'").fetchone():
+                sql, params = f"o.id IN (SELECT object_id FROM object_fns WHERE fn IN ({','.join('?' * len(fs))}))", fs
+            else:      # a directory built before the table existed
+                sql = "(" + " OR ".join("(',' || o.fns || ',') LIKE ?" for _ in fs) + ")"
+                params = [f"%,{x},%" for x in fs]
         elif f == "rank":
             sql, params = f"o.rank COLLATE NOCASE IN ({','.join('?' * len(vals))})", vals
         elif f == "grade":

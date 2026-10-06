@@ -9,6 +9,12 @@ retitles, arrivals and departures) so the Changes view has something to show.
 
     python3 tools/make_synthetic.py                    # 2 snapshots, ~1.4k people
     python3 tools/make_synthetic.py --scale 20 --snapshots 3   # ~28k people
+    python3 tools/make_synthetic.py --copies 300 --scale 7 --snapshots 1 --messy   # ~900k objects
+
+--copies repeats the whole organization under numbered names and spreads the copies over
+numbered sites, for directories with thousands of units. --messy writes a few people's
+department the way hand-kept directories drift: hyphenated, with a country prefix, or as a
+partner's liaison ("AU USSF …").
 """
 from __future__ import annotations
 
@@ -191,13 +197,24 @@ class Gen:
             return "civ"
         return "ctr"
 
+    messy = False
+
+    def dept_of(self, org):
+        """The department as typed: usually the org path, sometimes a drifted spelling of its root."""
+        if not self.messy or self.rng.random() > 0.05:
+            return org
+        root, _, rest = org.partition("/")
+        joined = root.replace(" ", "-")
+        variant = self.rng.choice([joined, "US" + joined, f"AU {service_of(org)} {root}"])
+        return variant + ("/" + rest if rest and self.rng.random() < 0.6 else "")
+
     def person(self, org, base, fn, title, gk, now_id=None):
         f, l = self.name()
         rank = self.rng.choice(GRADES[gk])
         mi = self.rng.choice("ABCDEFGHJKLMNPRSTW") if self.rng.random() < 0.8 else ""
         return {
             "guid": now_id or str(uuid.UUID(int=self.rng.getrandbits(128))),
-            "first": f, "last": l, "mi": mi, "rank": rank, "org": org, "base": base, "fn": fn, "title": title,
+            "first": f, "last": l, "mi": mi, "rank": rank, "org": org, "dept": self.dept_of(org), "base": base, "fn": fn, "title": title,
             "career": self.rng.choice(AFSC[fn]) if gk not in ("civ", "ctr") else "",
             "ext": self.rng.randint(1000, 9999),
         }
@@ -233,7 +250,7 @@ def email_of(p):
 
 
 def display_of(p):
-    return f"{p['last'].upper()}, {p['first'].upper()} {p['mi']} {p['rank']} {service_of(p['org'])} {p['org']}".replace("  ", " ")
+    return f"{p['last'].upper()}, {p['first'].upper()} {p['mi']} {p['rank']} {service_of(p['org'])} {p.get('dept') or p['org']}".replace("  ", " ")
 
 
 def phone_of(p):
@@ -257,6 +274,7 @@ def churn(g: Gen, people: list[dict], month: int) -> list[dict]:
             if same_root:
                 o = rng.choice(same_root)
                 q["org"], q["base"], q["fn"] = o[0], o[1], o[3]
+                q["dept"] = g.dept_of(o[0])
                 q["title"] = rng.choice(POOL[o[3]])
         if rng.random() < 0.025 and q["rank"] in PROMO:
             q["rank"] = PROMO[q["rank"]]
@@ -309,7 +327,7 @@ def write(people: list[dict], out: Path, rng: random.Random):
         rows.append({
             "DisplayName": display_of(p), "GivenName": p["first"].upper(), "Surname": p["last"].upper(),
             "Initials": p["mi"], "Title": p["title"],
-            "Department": p["org"], "Company": p["org"].split("/")[0].title(),
+            "Department": p.get("dept") or p["org"], "Company": p["org"].split("/")[0].title(),
             "Office": f"Bldg {1000 + zlib.crc32(p['org'].encode()) % 900}" if b[0] else "Research Park",
             "Phone": phone_of(p), "MobilePhone": "", "WindowsEmailAddress": email_of(p),
             "UserPrincipalName": f"{zlib.crc32(p['guid'].encode()) * 7 % 10**10:010d}@{DOMAIN}",
@@ -376,11 +394,35 @@ def write(people: list[dict], out: Path, rng: random.Random):
     return len(rows)
 
 
+def expand(copies: int) -> None:
+    """Repeat the organization `copies` times: copy k renames every root to "<root> k" and moves
+    to numbered sites, so a big run has thousands of units and a few hundred sites."""
+    global ORGS, REPORTS_TO, ORG_LEAD
+    orgs, reports = list(ORGS), dict(REPORTS_TO)
+    for k in range(2, copies + 1):
+        grp = k % 25
+
+        def rn(path):
+            root, sep, rest = path.partition("/")
+            return f"{root} {k}{sep}{rest}"
+        for path, base, *rest in ORGS:
+            key = f"{base}{grp}" if grp and SITES[base][0] else base
+            if key not in SITES:
+                ou, region, *more = SITES[base]
+                SITES[key] = (f"{ou} {grp}", region, *more)
+            orgs.append((rn(path), key, *rest))
+        reports.update({rn(a): rn(b) for a, b in REPORTS_TO.items()})
+    ORGS, REPORTS_TO = orgs, reports
+    ORG_LEAD = {o[0]: o[4] for o in ORGS}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--snapshots", type=int, default=2)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--copies", type=int, default=1)
+    ap.add_argument("--messy", action="store_true")
     ap.add_argument("--out", default=str(ROOT / "data" / "synthetic"))
     a = ap.parse_args()
     out_dir = Path(a.out)
@@ -388,7 +430,10 @@ def main():
     sites = [{"name": SITES[k][0], "full": f"{SITES[k][0]} ({SITES[k][2]})", "lat": c[0], "lon": c[1], "tz": c[2],
               "country": c[3], "state": c[4], "aliases": [SITES[k][2]]} for k, c in COORDS.items()]
     (out_dir / "sites.json").write_text(json.dumps({"sites": sites}, indent=1), encoding="utf-8")
+    if a.copies > 1:
+        expand(a.copies)
     g = Gen(a.seed, a.scale)
+    g.messy = a.messy
     g.build()
     people = g.people
     start = date.today() - timedelta(days=30 * (a.snapshots - 1))

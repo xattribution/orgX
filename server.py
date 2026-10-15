@@ -25,6 +25,7 @@ import time
 import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -34,9 +35,92 @@ ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MAX_UPLOAD = 2 * 1024**3
 
+# Answers that depend only on the directory, its notes and rules. They are kept until any of
+# those change, so going back, reopening a unit or re-running a search is instant.
+CACHEABLE = {"/api/search", "/api/facets", "/api/object", "/api/org", "/api/orgtree", "/api/orgs", "/api/locations",
+             "/api/location", "/api/ask", "/api/topics", "/api/changes", "/api/quality", "/api/tags"}
+# POSTs that only read (or change org.db, whose own timestamp then moves)
+READ_POSTS = {"/api/resolve", "/api/ad/test", "/api/live/search", "/api/live/person", "/api/live/unit", "/api/live/site"}
+# what the first screens ask for, worked out ahead of the first visit after each load
+WARM = [("/api/locations", {}), ("/api/orgs", {"parent": ""}), ("/api/orgtree", {"depth": "1", "cap": "80"}),
+        ("/api/orgtree", {"depth": "2", "cap": "30"}), ("/api/facets", {"q": ""}), ("/api/topics", {}),
+        ("/api/search", {"q": "", "sort": "smart", "limit": "100"}), ("/api/quality", {})]
+
+
+class Answers:
+    def __init__(self, max_bytes: int = 128 * 1024**2, max_items: int = 600):
+        self.items: "OrderedDict[tuple, bytes]" = OrderedDict()
+        self.bytes = 0
+        self.max_bytes, self.max_items = max_bytes, max_items
+        self.version = None
+        self.lock = threading.Lock()
+
+    def key(self, path: str, p: dict) -> tuple:
+        return (path, tuple(sorted((k, v) for k, v in p.items() if not k.startswith("_"))))
+
+    def get(self, version, key):
+        with self.lock:
+            if version != self.version:
+                self.items.clear()
+                self.bytes = 0
+                self.version = version
+                return None
+            body = self.items.get(key)
+            if body is not None:
+                self.items.move_to_end(key)
+            return body
+
+    def put(self, version, key, body: bytes):
+        with self.lock:
+            if version != self.version or len(body) > self.max_bytes // 8:
+                return
+            old = self.items.pop(key, None)
+            self.bytes += len(body) - (len(old) if old else 0)
+            self.items[key] = body
+            while self.items and (self.bytes > self.max_bytes or len(self.items) > self.max_items):
+                _, b = self.items.popitem(last=False)
+                self.bytes -= len(b)
+
+
+def answer(ctx: api.Ctx, cache: Answers, path: str, p: dict) -> bytes | None:
+    """The JSON body for a cacheable GET, from the cache or computed and kept."""
+    version = ctx.version()
+    k = cache.key(path, p)
+    body = cache.get(version, k)
+    if body is None:
+        ctx.begin()
+        try:
+            out = api.GET[path](ctx, p, None)
+        finally:
+            ctx.end()
+        body = json.dumps(out, default=str, separators=(",", ":")).encode()
+        if not (isinstance(out, dict) and out.get("error")):
+            cache.put(version, k, body)
+    return body
+
+
+def warm_loop(ctx: api.Ctx, cache: Answers):
+    seen = None
+    while True:
+        time.sleep(3)
+        try:
+            v = ctx.version()
+            if v == seen or ctx.job["running"] or not v[0]:
+                continue
+            time.sleep(2)
+            if ctx.version() != v:
+                continue                    # still being written; wait for it to settle
+            for path, p in WARM:
+                answer(ctx, cache, path, dict(p))
+            seen = v
+        except Exception:  # noqa: BLE001 — warming is best effort
+            traceback.print_exc()
+            time.sleep(30)
+
 
 class Handler(BaseHTTPRequestHandler):
     ctx: api.Ctx
+    cache = Answers()
     allow_upload = True
     server_version = "orgx/1"
 
@@ -79,6 +163,15 @@ class Handler(BaseHTTPRequestHandler):
             fn = api.GET.get(path)
             if not fn:
                 return self.json({"error": "unknown endpoint"}, 404)
+            if path in CACHEABLE:
+                try:
+                    body = answer(self.ctx, self.cache, path, p)
+                except api.NoData:
+                    return self.json({"error": "no data yet", "empty": True}, 409)
+                except Exception as e:  # noqa: BLE001
+                    traceback.print_exc()
+                    return self.json({"error": f"{type(e).__name__}: {e}"}, 500)
+                return self.send(200, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
             return self.dispatch(fn, p, None)
         self.static(path)
 
@@ -103,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, fn, p, body):
         p["_client"] = self.client_address[0]
+        self.ctx.begin()
         try:
             out = fn(self.ctx, p, body)
         except api.NoData:
@@ -110,6 +204,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             return self.json({"error": f"{type(e).__name__}: {e}"}, 500)
+        finally:
+            self.ctx.end()
+            if self.command == "POST" and urlparse(self.path).path not in READ_POSTS:
+                self.ctx.writes += 1
         if isinstance(out, tuple):
             data, ctype, fname = out
             extra = {"Cache-Control": "no-store"}
@@ -181,7 +279,10 @@ def main():
         if not (data / name).exists() and (ROOT / "data" / name).exists():
             shutil.copy(ROOT / "data" / name, data / name)
     ctx = api.Ctx(data)
+    from orgx import ingest as ing
+    ing.upgrade(data)
     Handler.ctx = ctx
+    threading.Thread(target=warm_loop, args=(ctx, Handler.cache), daemon=True).start()
     Handler.allow_upload = os.environ.get("ORGX_UPLOAD", "1") != "0"
     if a.demo and not (data / "org.db").exists():
         print("demo: seeding synthetic directory …")

@@ -1,6 +1,6 @@
 /* Record panel: person / org box / DL / room, office summary, base summary. */
 import { $, esc, attr, plainName, copy, say, modal, shortOrg, fmt, icon, info, menu } from "./ui.js";
-import { api, post, apiUrl, settings, state, isStarred, toggleStar, pushRecent } from "./store.js";
+import { api, post, apiUrl, settings, state, isStarred, toggleStar, pushRecent, liveFetch } from "./store.js";
 import { ltHtml, localTime, dateMil, offsetLabel } from "./time.js";
 import { openEmailBuilder } from "./email.js";
 
@@ -17,17 +17,22 @@ export function close() {
   el.hidden = true;
   current = "";
 }
-export async function open(ref) {
+export async function open(ref, refresh = false) {
   current = ref;
   el.hidden = false;
   const [type, ...rest] = ref.split(":");
   const id = rest.join(":");
-  el.innerHTML = `<div class="dr-top"><span class="sp"></span><button class="btn sm icon quiet" data-close aria-label="Close" title="Close (Esc)">${icon("x")}</button></div><div class="dr-body"><div class="loading">Loading…</div></div>`;
-  el.querySelector("[data-close]").onclick = closeFn;
+  if (!refresh) {      // a refresh redraws in place, without the loading state
+    el.innerHTML = `<div class="dr-top"><span class="sp"></span><button class="btn sm icon quiet" data-close aria-label="Close" title="Close (Esc)">${icon("x")}</button></div><div class="dr-body"><div class="loading">Loading…</div></div>`;
+    el.querySelector("[data-close]").onclick = closeFn;
+  }
   try {
     if (type === "p") await person(id);
     else if (type === "o") await office(id);
     else if (type === "l") await base(id);
+    // on-the-fly mode: fetch what surrounds this record, then redraw it once if anything arrived
+    const kind = { p: ["person", { key: id }], o: ["unit", { id }], l: ["site", { id }] }[type];
+    if (kind && !refresh) liveFetch(...kind).then((ch) => { if (ch && current === ref) open(ref, true); });
   } catch (e) {
     if (current === ref) el.querySelector(".dr-body").innerHTML = `<div class="empty"><b>Couldn't load this record</b>${esc(e.message)}</div>`;
   }

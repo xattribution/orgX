@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db as dbm
+from . import fold
 from . import geo
 from . import parse as P
 from . import reference as ref
@@ -53,11 +54,11 @@ def rows(path: Path):
     fh.seek(0)
     if first.startswith("#TYPE"):
         fh.readline()
-    try:
-        dialect = csv.Sniffer().sniff(sample.split("\n", 1)[0], delimiters=",\t;|")
+    try:      # sniff only the delimiter; quoting is always standard ("" inside a quoted field)
+        delim = csv.Sniffer().sniff(sample.split("\n", 1)[0], delimiters=",\t;|").delimiter
     except csv.Error:
-        dialect = csv.excel
-    reader = csv.reader(fh, dialect)
+        delim = ","
+    reader = csv.reader(fh, delimiter=delim)
     header = next(reader, [])
     yield header
     for r in reader:
@@ -92,13 +93,14 @@ def make_key(row: dict, email: str, dn: str, first: str, last: str, mi: str, tit
 
 
 class Builder:
-    def __init__(self, data_dir: Path, rules: dict, levels: dict | None = None):
+    def __init__(self, data_dir: Path, rules: dict, levels: dict | None = None, fold: dict | None = None):
         self.data_dir = data_dir
         self.rules = rules
         self.gaz = geo.Gazetteer(data_dir, rules.get("baseAliases"), levels)
         self.kw = R.fn_keywords(rules)
         self.anchors = [a for a in (rules.get("anchors") or []) if a.strip()]
         self.org_alias = {k.upper(): v for k, v in (rules.get("orgAliases") or {}).items()}
+        self.fold = fold or {}       # drifted spellings of a unit → the spelling kept (orgx/fold.py)
         self.skip_kinds = set(rules.get("skipKinds") or [])
         P.CODE_OVERRIDES.clear()
         P.CODE_OVERRIDES.update({k.upper().replace(" ", ""): v for k, v in (rules.get("codeFunctions") or {}).items()
@@ -113,6 +115,26 @@ class Builder:
         self.loc_people: Counter = Counter()
         self.keys: set[str] = set()
         self.stats = Counter()
+        # titles, org paths, OU paths and cities repeat across a directory: work each out once
+        self._places: dict[tuple, dict] = {}
+        self._by_path: dict[tuple, dict] = {}
+        self._by_title: dict[str, dict] = {}
+        self._by_career: dict[str, str] = {}
+
+    def functions(self, text: str, path: tuple, career: str) -> list[str]:
+        """P.classify_functions, with each of its three inputs scored once per distinct value."""
+        ps = self._by_path.get(path)
+        if ps is None:
+            ps = self._by_path[path] = P.path_scores(path)
+        ts = self._by_title.get(text)
+        if ts is None:
+            ts = P.title_scores(text, self.kw)
+            if len(self._by_title) < 300_000:
+                self._by_title[text] = ts
+        cf = self._by_career.get(career)
+        if cf is None:
+            cf = self._by_career[career] = P.career_function(career)
+        return P.combine_scores(ps, ts, career_fn=cf)
 
     def record(self, row: dict, extras: dict) -> tuple | None:
         display = P.clean(row.get("display"))
@@ -157,11 +179,18 @@ class Builder:
             path = P.org_path(stripped.strip(" -–"), "")
         if path and path[0].upper() in self.org_alias:
             path = [self.org_alias[path[0].upper()]] + path[1:]
+        elif path and path[0] in self.fold:
+            path = [self.fold[path[0]]] + path[1:]
         org_id = "/".join(path)
 
         office = P.clean(row.get("office"))
         city, state, country = P.clean(row.get("city")), P.clean(row.get("state")), P.clean(row.get("country"))
-        loc = self.gaz.place(ous, self.anchors, office, city, state, country)
+        pk = (tuple(ous), office, city, state, country)
+        loc = self._places.get(pk)
+        if loc is None:
+            loc = self.gaz.place(ous, self.anchors, office, city, state, country)
+            if len(self._places) < 300_000:
+                self._places[pk] = loc
         if loc["id"]:
             if loc["id"] not in self.locs:
                 self.locs[loc["id"]] = loc
@@ -177,7 +206,7 @@ class Builder:
         if not career and kind == "person":
             m = ref.AFSC_RE.search(f"{title} {P.clean(row.get('description'))}")
             career = m.group(1) if m else ""
-        fns = P.classify_functions(f"{title} {display if kind != 'person' else ''}", path, career, self.kw)
+        fns = self.functions(f"{title} {display if kind != 'person' else ''}", tuple(path), career)
         lead = ref.leader_score(title) if kind == "person" else 0
         level = ref.grade_level(grade)
         category = category_of(grade, service, email) if kind == "person" else ""
@@ -370,6 +399,118 @@ def build_orgs(b: Builder, mgr_links: dict[str, Counter]) -> dict[str, dict]:
     return orgs
 
 
+def manager_links(conn: sqlite3.Connection) -> dict[str, Counter]:
+    """top-level org → {org its people's managers sit in: count}"""
+    links: dict[str, Counter] = defaultdict(Counter)
+    for oid, moid, n in conn.execute("""SELECT o.org_id, m.org_id, count(*) FROM objects o
+            JOIN objects m ON m.key = o.manager_key
+            WHERE o.org_id <> '' AND m.org_id <> '' AND o.org_id <> m.org_id GROUP BY 1, 2"""):
+        links[oid.split("/")[0]][moid] += n
+    return links
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Directories built before the root columns existed (on-the-fly stores) get them in place."""
+    for table, col in (("orgs", "root"), ("objects", "org_root")):
+        if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+
+
+def write_fns(conn: sqlite3.Connection) -> None:
+    """One row per (function, object): fn: filters become index lookups instead of a LIKE over every row."""
+    conn.execute("CREATE TABLE IF NOT EXISTS object_fns (fn TEXT, object_id INTEGER, PRIMARY KEY (fn, object_id)) WITHOUT ROWID")
+    conn.execute("DELETE FROM object_fns")
+    cur = conn.execute("SELECT id, fns FROM objects WHERE fns <> ''")
+    while True:
+        chunk = cur.fetchmany(50_000)
+        if not chunk:
+            break
+        conn.executemany("INSERT OR IGNORE INTO object_fns VALUES (?,?)",
+                         [(f, oid) for oid, fns in chunk for f in fns.split(",") if f])
+
+
+def write_orgs(conn: sqlite3.Connection, orgs: dict[str, dict]) -> None:
+    _ensure_columns(conn)
+    for o in orgs.values():           # top-level unit of each office, for the unit facet
+        r, seen = o, set()
+        while r.get("parent") and r["parent"] in orgs and r["id"] not in seen:
+            seen.add(r["id"])
+            r = orgs[r["parent"]]
+        o["root"] = r["id"]
+    conn.execute("DELETE FROM orgs")
+    conn.executemany(
+        "INSERT INTO orgs VALUES (:id,:name,:parent,:depth,:kind,:fn,:direct,:total,:people,:leader_key,"
+        ":leader_by,:loc_id,:locs,:inferred,:lft,:rgt,:sort,:site,:root)", list(orgs.values()))
+    conn.execute("UPDATE objects SET (org_lft, org_root) = (SELECT lft, root FROM orgs WHERE orgs.id = objects.org_id)")
+
+
+class DbAggregates:
+    """The per-org totals build_orgs needs, recomputed from the objects table (on-the-fly mode)."""
+
+    def __init__(self, conn: sqlite3.Connection, rules: dict):
+        self.rules = rules
+        self.org_direct: Counter = Counter()
+        self.org_people: Counter = Counter()
+        self.org_best: dict[str, tuple] = {}
+        self.org_locs: dict[str, Counter] = defaultdict(Counter)
+        for key, kind, org_id, loc_id, lead, level in conn.execute(
+                "SELECT key, kind, org_id, loc_id, leader, level FROM objects WHERE org_id <> ''"):
+            self.org_direct[org_id] += 1
+            if loc_id:
+                self.org_locs[org_id][loc_id] += 1
+            if kind == "person":
+                self.org_people[org_id] += 1
+                cand = (lead or 0, level or 0, key)
+                if org_id not in self.org_best or cand[:2] > self.org_best[org_id][:2]:
+                    self.org_best[org_id] = cand
+
+
+def upgrade(data_dir: Path, log=print) -> bool:
+    """Bring a directory built by an older version up to the current layout in place (unit roots,
+    the function table, the current indexes and planner statistics), so it works without a reload."""
+    path = data_dir / "org.db"
+    if not path.exists():
+        return False
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        have = conn.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+        if have and int(have[0]) >= dbm.SCHEMA_VERSION:
+            return False
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'objects'").fetchone():
+            return False
+        log("upgrading the directory to the current layout (once) …")
+        _ensure_columns(conn)
+        parent = dict(conn.execute("SELECT id, parent FROM orgs").fetchall())
+        def top(i):
+            seen = set()
+            while parent.get(i) and parent[i] in parent and i not in seen:
+                seen.add(i)
+                i = parent[i]
+            return i
+        conn.executemany("UPDATE orgs SET root = ? WHERE id = ?", [(top(i), i) for i in parent])
+        conn.execute("UPDATE objects SET org_root = (SELECT root FROM orgs WHERE orgs.id = objects.org_id)")
+        write_fns(conn)
+        # indexes whose definition changed are rebuilt; leftovers from older builds go
+        want = {}
+        for stmt in dbm.INDEXES.split(";"):
+            m = re.search(r"CREATE INDEX IF NOT EXISTS (\w+)", stmt)
+            if m:
+                want[m.group(1)] = re.sub(r"\s+", " ", stmt.strip().replace("IF NOT EXISTS ", ""))
+        for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL").fetchall():
+            if name in ("tmp_dn", "tmp_em", "tmp_key", "ob_fn") or (name in want and re.sub(r"\s+", " ", sql) != want[name]):
+                conn.execute(f"DROP INDEX {name}")
+        conn.executescript(dbm.INDEXES)
+        conn.execute("PRAGMA analysis_limit = 2000")
+        conn.execute("ANALYZE")
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(dbm.SCHEMA_VERSION),))
+        conn.commit()
+        log("upgrade done")
+        return True
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- diff
 # (type, row source, before, after, where). Rows come from n (new) and/or o (old).
 _J = "main.objects n JOIN old.objects o ON o.key = n.key"
@@ -397,17 +538,40 @@ def diff_sql(snap_id: int, etype: str, src: str, before: str, after: str, where:
 
 # ---------------------------------------------------------------- learned structure
 def learn_ous(csv_path: Path, idx: dict) -> geo.OuLearner:
+    return prepass(csv_path, idx)[0]
+
+
+def prepass(csv_path: Path, idx: dict) -> tuple[geo.OuLearner, Counter]:
+    """One read before the build: the OU structure (which depth holds sites, from DN and City) and
+    how often each unit root is spelled each way (from Department)."""
     lr = geo.OuLearner()
+    roots: Counter = Counter()
+    root_of: dict[str, str] = {}
     it = rows(csv_path)
     next(it)
-    i_dn, i_ou, i_city = idx.get("dn"), idx.get("ou"), idx.get("city")
+    i_dn, i_ou, i_city, i_dept = idx.get("dn"), idx.get("ou"), idx.get("city"), idx.get("department")
     for r in it:
         dn = r[i_dn] if i_dn is not None and i_dn < len(r) else ""
         ou = r[i_ou] if i_ou is not None and i_ou < len(r) else ""
         ous, _ = P.ou_path(P.clean(dn), P.clean(ou))
         if ous:
             lr.add(ous, r[i_city] if i_city is not None and i_city < len(r) else "")
-    return lr
+        dept = r[i_dept] if i_dept is not None and i_dept < len(r) else ""
+        if dept:
+            root = root_of.get(dept)
+            if root is None:
+                path = P.org_path(P.clean(dept), "")
+                root = root_of[dept] = path[0] if path else ""
+            if root:
+                roots[root] += 1
+    return lr, roots
+
+
+def plan_folds(roots: Counter, rules: dict) -> tuple[list[dict], list[dict]]:
+    if not rules.get("foldSpellings", True):
+        return [], []
+    folds = fold.plan(roots, rules.get("orgSeparate") or [], rules.get("orgAliases") or {})
+    return folds, fold.suggest(roots, fold.mapping(folds))
 
 
 def save_learned(conn: sqlite3.Connection, learner: geo.OuLearner, levels: dict) -> None:
@@ -432,7 +596,7 @@ def as_of_date(csv_path: Path, override: str | None = None) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None) -> dict:
+def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None, before_swap=None) -> dict:
     t0 = time.time()
     rules = R.load(data_dir)
     final = data_dir / "org.db"
@@ -461,9 +625,12 @@ def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None) 
         raise ValueError(f"no DisplayName / name / email column found in {csv_path.name}; headers: {header[:12]}")
 
     # first pass: learn the OU structure (which depth holds sites) from DN/OU and City only
-    learner = learn_ous(csv_path, idx)
+    learner, roots = prepass(csv_path, idx)
     levels = learner.result()
-    b = Builder(data_dir, rules, levels)
+    folds, suggestions = plan_folds(roots, rules)
+    if folds:
+        log(f"  folding {len(folds):,} drifted unit spellings")
+    b = Builder(data_dir, rules, levels, fold.mapping(folds))
     ins = f"INSERT INTO objects ({','.join(dbm.OBJECT_COLS)}) VALUES ({','.join('?' * len(dbm.OBJECT_COLS))})"
     batch, mem_batch, n_rows = [], [], 0
     for r in it:
@@ -496,44 +663,43 @@ def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None) 
     conn.commit()
 
     # managers (by DN, then by email) and members — each join is a separate indexed lookup
-    conn.execute("CREATE INDEX tmp_dn ON objects(lower(dn))")
-    conn.execute("CREATE INDEX tmp_em ON objects(lower(email))")
-    conn.execute("CREATE INDEX tmp_key ON objects(key)")
-    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE lower(m.dn) = lower(objects.manager_dn) LIMIT 1)
+    log("  linking managers and members")
+    conn.execute("CREATE INDEX ob_dn ON objects(dn COLLATE NOCASE)")
+    conn.execute("CREATE INDEX ob_email ON objects(email COLLATE NOCASE)")
+    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE m.dn = objects.manager_dn COLLATE NOCASE LIMIT 1)
         WHERE manager_dn <> '' AND instr(manager_dn, '=') > 0""")
-    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE lower(m.email) = lower(objects.manager_dn) LIMIT 1)
+    conn.execute("""UPDATE objects SET manager_key = (SELECT m.key FROM objects m WHERE m.email = objects.manager_dn COLLATE NOCASE LIMIT 1)
         WHERE manager_key IS NULL AND instr(manager_dn, '@') > 0""")
     conn.execute("CREATE INDEX tmp_sm ON stage_members(group_key)")
     for via in ("dn", "email"):
         # Members column: (group key, member DN/email)
         conn.execute(f"""INSERT OR IGNORE INTO members
             SELECT g.id, m.id FROM stage_members s JOIN objects g ON g.key = s.group_key
-            JOIN objects m ON lower(m.{via}) = s.ref WHERE substr(s.group_key, 1, 1) <> '@'""")
+            JOIN objects m ON m.{via} = s.ref COLLATE NOCASE WHERE substr(s.group_key, 1, 1) <> '@'""")
         # MemberOf column: ('@' + group DN/email, member key)
         conn.execute(f"""INSERT OR IGNORE INTO members
             SELECT g.id, m.id FROM stage_members s JOIN objects m ON m.key = s.ref
-            JOIN objects g ON lower(g.{via}) = substr(s.group_key, 2) WHERE substr(s.group_key, 1, 1) = '@'""")
+            JOIN objects g ON g.{via} = substr(s.group_key, 2) COLLATE NOCASE WHERE substr(s.group_key, 1, 1) = '@'""")
     conn.execute("DROP TABLE stage_members")
 
-    mgr_links: dict[str, Counter] = defaultdict(Counter)
-    for oid, moid, n in conn.execute("""SELECT o.org_id, m.org_id, count(*) FROM objects o
-            JOIN objects m ON m.key = o.manager_key
-            WHERE o.org_id <> '' AND m.org_id <> '' AND o.org_id <> m.org_id GROUP BY 1, 2"""):
-        mgr_links[oid.split("/")[0]][moid] += n
-
-    orgs = build_orgs(b, mgr_links)
-    conn.executemany(
-        "INSERT INTO orgs VALUES (:id,:name,:parent,:depth,:kind,:fn,:direct,:total,:people,:leader_key,"
-        ":leader_by,:loc_id,:locs,:inferred,:lft,:rgt,:sort,:site)", list(orgs.values()))
-    conn.execute("UPDATE objects SET org_lft = (SELECT lft FROM orgs WHERE orgs.id = objects.org_id)")
+    orgs = build_orgs(b, manager_links(conn))
+    write_orgs(conn, orgs)
+    write_fns(conn)
     conn.executemany(
         "INSERT INTO locations VALUES (:id,:name,:full,:lat,:lon,:tz,:country,:state,:region,:approx,:ou,:total,:people)",
         [{**loc, "total": b.loc_total[lid], "people": b.loc_people[lid]} for lid, loc in b.locs.items()])
-    conn.execute("DROP INDEX tmp_key")
     save_learned(conn, learner, levels)
+    conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                     [("folds", json.dumps(folds)), ("fold_suggestions", json.dumps(suggestions)),
+                      ("schema", str(dbm.SCHEMA_VERSION))])
+    log("  indexing")
     conn.executescript(dbm.INDEXES)
     if dbm.has_fts5():
         conn.executescript(dbm.FTS)
+    # statistics, so the query planner knows which indexes narrow a search (without them it
+    # guesses, and picks scans over a million rows)
+    conn.execute("PRAGMA analysis_limit = 2000")
+    conn.execute("ANALYZE")
     conn.commit()
 
     # history: carry forward + diff against the previous build
@@ -567,7 +733,16 @@ def ingest(csv_path: Path, data_dir: Path, log=print, as_of: str | None = None) 
     conn.execute("UPDATE snapshots SET seconds = ? WHERE id = ?", (secs, snap_id))
     conn.commit()
     conn.close()
-    os.replace(tmp, final)
+    if before_swap:
+        before_swap()          # let readers close their handles to the old file
+    for attempt in range(50):  # Windows refuses to replace a file a reader still holds open
+        try:
+            os.replace(tmp, final)
+            break
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.2)
     dbm.init_annotations(data_dir)
 
     meta = {

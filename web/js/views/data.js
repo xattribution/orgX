@@ -35,8 +35,10 @@ async function sources(body) {
           <label>Domain</label><input class="input mono" data-ad="server" value="${attr(ad.config.server)}" placeholder="Your own domain">
           <label>Search bases</label><div><textarea class="input mono" rows="2" style="width:100%" data-ad="bases" placeholder="Blank: the whole domain. One DN per line, e.g. OU=Sites,DC=corp,DC=example">${esc((ad.config.bases || []).join("\n"))}</textarea></div>
           <label>Method ${info('ADSI uses the .NET directory searcher built into Windows with your Kerberos sign-in, the same way AD Explorer connects. RSAT uses the ActiveDirectory module and is needed if PowerShell runs in Constrained Language mode.')}</label><div><select class="input" data-ad="method">${["Auto", "ADSI", "RSAT"].map((m) => `<option ${ad.config.method === m ? "selected" : ""}>${m}</option>`).join("")}</select></div>
-          <label>Group members</label><label class="chk"><input type="checkbox" data-ad="members" ${ad.config.members ? "checked" : ""}>Export DL membership (slower on large domains)</label>
-          <label>Schedule</label><div><select class="input" data-ad="hours">${[[0, "Manual only"], [6, "Every 6 hours"], [12, "Every 12 hours"], [24, "Daily"], [168, "Weekly"]].map(([h, l]) => `<option value="${h}" ${+ad.config.hours === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="export">Group members</label><label class="chk" data-for="export"><input type="checkbox" data-ad="members" ${ad.config.members ? "checked" : ""}>Export DL membership (slower on large domains)</label>
+          <label>Mode ${info("Full export reads the whole directory into ORGX on a schedule. On the fly looks up only what you search for or open, with a couple of levels above and below it, and keeps it.")}</label><div><select class="input" data-ad="mode">${[["export", "Full export"], ["live", "On the fly"]].map(([v, l]) => `<option value="${v}" ${(ad.config.mode || "export") === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="live">Look up again after</label><div data-for="live"><select class="input" data-ad="liveHours">${[[1, "1 hour"], [4, "4 hours"], [12, "12 hours"], [24, "1 day"], [168, "1 week"]].map(([h, l]) => `<option value="${h}" ${+(ad.config.liveHours || 12) === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label data-for="export">Schedule</label><div data-for="export"><select class="input" data-ad="hours">${[[0, "Manual only"], [6, "Every 6 hours"], [12, "Every 12 hours"], [24, "Daily"], [168, "Weekly"]].map(([h, l]) => `<option value="${h}" ${+ad.config.hours === h ? "selected" : ""}>${l}</option>`).join("")}</select></div>
         </div>
         <div style="display:flex;gap:6px;margin:10px 0"><button class="btn" data-adsave>Save</button><button class="btn" data-adtest>Test connection</button><button class="btn primary" data-adsync ${job.running ? "disabled" : ""}>Sync now</button></div>
         <div data-adout>${st.test ? testHtml(st.test, st.last_test) : ""}${st.last_sync ? `<p class="note">Last sync ${esc(st.last_sync.replace("T", " ").slice(0, 16))}Z${st.sync?.count ? `, ${fmt(st.sync.count)} objects in ${st.sync.seconds} s by ${esc(st.sync.method)}` : ""}.</p>` : ""}</div>`
@@ -74,8 +76,12 @@ async function sources(body) {
     server: body.querySelector("[data-ad=server]").value.trim(), method: body.querySelector("[data-ad=method]").value,
     bases: body.querySelector("[data-ad=bases]").value.split("\n").map((s) => s.trim()).filter(Boolean),
     members: body.querySelector("[data-ad=members]").checked, hours: +body.querySelector("[data-ad=hours]").value,
+    mode: body.querySelector("[data-ad=mode]").value, liveHours: +body.querySelector("[data-ad=liveHours]").value,
   });
-  body.querySelector("[data-adsave]")?.addEventListener("click", async () => { await post("/api/rules", { ad: adcfg() }); say("AD settings saved"); });
+  const modeSel = body.querySelector("[data-ad=mode]");
+  const showMode = () => body.querySelectorAll("[data-for]").forEach((el) => { el.hidden = el.dataset.for !== modeSel.value; });
+  if (modeSel) { modeSel.onchange = showMode; showMode(); }
+  body.querySelector("[data-adsave]")?.addEventListener("click", async () => { await post("/api/rules", { ad: adcfg() }); await refreshMeta(); say("AD settings saved"); });
   body.querySelector("[data-adtest]")?.addEventListener("click", async (e) => {
     await post("/api/rules", { ad: adcfg() });
     e.target.disabled = true;
@@ -130,6 +136,18 @@ async function quality(body) {
         ${q.approx.map((a) => `<tr><td><b>${esc(a.name)}</b><div class="note">${esc(a.full || "")}</div></td><td>${esc(a.region || a.country || "")}</td><td class="num">${fmt(a.total)}</td>
           <td><select class="input" data-alias="${attr(a.ou || a.name)}"><option value="">(none)</option>${rr.bases.map((b) => `<option ${rr.rules.baseAliases?.[a.ou || a.name] === b ? "selected" : ""}>${esc(b)}</option>`).join("")}</select></td></tr>`).join("")}
         </tbody></table><div style="margin-top:8px"><button class="btn primary sm" data-save-alias>Save and reload</button></div>` : ""}
+      ${q.folds?.length ? `<h2 class="h">Unit spellings merged <span class="n">${fmt(q.foldCount)}</span> ${info("Spellings of one unit that differ only in case, spacing or punctuation, or that carry a country or service tag in front (US…, AU USSF …), are filed under the spelling most people use.")}</h2>
+        <table class="tbl"><thead><tr><th>Filed under</th><th>Also written as (tick to keep separate)</th><th class="num">Records</th></tr></thead><tbody>
+        ${q.folds.map((g) => `<tr><td><a data-org="${attr(g.into)}">${esc(g.into)}</a></td>
+          <td class="variants">${g.variants.map((f) => `<label class="chk"><input type="checkbox" data-separate="${attr(f.from)}" ${(rr.rules.orgSeparate || []).includes(f.from) ? "checked" : ""}>${esc(f.from)} <span class="dim">${fmt(f.n)}</span></label>`).join("")}</td>
+          <td class="num">${fmt(g.n)}</td></tr>`).join("")}
+        </tbody></table>${q.folds.length < q.foldCount ? `<p class="note">The units with the most merged records are shown.</p>` : ""}` : ""}
+      ${q.suggestions?.length ? `<h2 class="h">Possibly the same unit ${info("One character apart. Not merged unless you choose to.")}</h2>
+        <table class="tbl"><thead><tr><th>Spelling</th><th>Looks like</th><th class="num">Records</th><th></th></tr></thead><tbody>
+        ${q.suggestions.map((f) => `<tr><td>${esc(f.from)}</td><td>${esc(f.into)} <span class="dim">${fmt(f.into_n)}</span></td><td class="num">${fmt(f.n)}</td>
+          <td><label class="chk"><input type="checkbox" data-merge="${attr(f.from)}" data-into="${attr(f.into)}" ${rr.rules.orgAliases?.[f.from] === f.into ? "checked" : ""}>Merge</label></td></tr>`).join("")}
+        </tbody></table>` : ""}
+      ${q.folds?.length || q.suggestions?.length ? `<div style="margin:8px 0 0"><button class="btn primary sm" data-save-folds>Save and reload</button></div>` : ""}
       ${q.leaderless.length ? `<h2 class="h">Offices with no leadership title ${info("The lead falls back to the most senior member.")}</h2>
         <table class="tbl"><tbody>${q.leaderless.map((o) => `<tr class="click" data-org="${attr(o.id)}"><td>${esc(o.id)}</td><td class="dim">${o.senior ? esc((o.rank || "") + " " + o.senior) : ""}</td><td class="num">${o.people}</td></tr>`).join("")}</tbody></table>` : ""}
     </div><div>
@@ -140,6 +158,15 @@ async function quality(body) {
         <table class="tbl"><tbody>${q.inferred.map((o) => `<tr><td><a data-org="${attr(o.id)}">${esc(o.id)}</a></td><td>under <a data-org="${attr(o.parent)}">${esc(o.parent)}</a></td><td class="dim">${esc(o.inferred)}</td></tr>`).join("")}</tbody></table>` : ""}
       ${q.dups.length ? `<h2 class="h">Shared email addresses</h2><table class="tbl"><tbody>${q.dups.map((d) => `<tr><td><a data-q="email:${attr(d.email)}">${esc(d.email)}</a></td><td class="num">${d.n}</td><td class="dim">${esc(d.names)}</td></tr>`).join("")}</tbody></table>` : ""}
     </div></div>`;
+  body.querySelector("[data-save-folds]")?.addEventListener("click", async () => {
+    const separate = new Set(rr.rules.orgSeparate || []);
+    body.querySelectorAll("[data-separate]").forEach((c) => { if (c.checked) separate.add(c.dataset.separate); else separate.delete(c.dataset.separate); });
+    const aliases = { ...(rr.rules.orgAliases || {}) };
+    body.querySelectorAll("[data-merge]").forEach((c) => { if (c.checked) aliases[c.dataset.merge] = c.dataset.into; else if (aliases[c.dataset.merge] === c.dataset.into) delete aliases[c.dataset.merge]; });
+    await post("/api/rules", { orgSeparate: [...separate], orgAliases: aliases });
+    const r = await post("/api/reingest", {});
+    say(r.error ? esc(r.error) : "Reloading with the new unit rules");
+  });
   body.querySelector("[data-save-alias]")?.addEventListener("click", async () => {
     const aliases = { ...(rr.rules.baseAliases || {}) };
     body.querySelectorAll("[data-alias]").forEach((s) => { if (s.value) aliases[s.dataset.alias] = s.value; else delete aliases[s.dataset.alias]; });

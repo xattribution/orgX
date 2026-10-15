@@ -87,3 +87,25 @@ export async function loadMeta() {
   }
   return state.meta;
 }
+
+/* ---------------------------------------------------------------- on-the-fly mode
+   Ask the server to fetch from Active Directory around what's on screen. Resolves to true when
+   new or changed records arrived (and announces them with an "orgx:live" event). */
+const liveBusy = new Map();
+export function liveFetch(kind, body) {
+  if (!state.meta?.live?.on) return Promise.resolve(false);
+  const k = `${kind}|${JSON.stringify(body)}`;
+  if (liveBusy.has(k)) return liveBusy.get(k);
+  const p = post(`/api/live/${kind}`, body).then((r) => {
+    liveBusy.delete(k);
+    if (r?.error) window.dispatchEvent(new CustomEvent("orgx:live-error", { detail: r.error }));
+    if (!r || r.cached || (r.added || 0) + (r.updated || 0) === 0) return false;
+    // new records can bring new bases; refresh those before anyone redraws
+    return api("/api/locations").then((l) => { state.locs = new Map(l.locations.map((x) => [x.id, x])); }).catch(() => {}).then(() => {
+      window.dispatchEvent(new CustomEvent("orgx:live", { detail: { kind, ...r } }));
+      return true;
+    });
+  }).catch(() => { liveBusy.delete(k); return false; });
+  liveBusy.set(k, p);
+  return p;
+}

@@ -13,6 +13,9 @@ DEFAULTS = {
     "baseAliases": {},
     # first org segment rewrites (e.g. "ATLAS CMD": "ATLAS COMMAND")
     "orgAliases": {},
+    # fold drifted spellings of one unit ("X", "X-Y", "USX", "AU USSF X"); orgSeparate keeps a spelling apart
+    "foldSpellings": True,
+    "orgSeparate": [],
     # explicit org parents: "HARBOR COMM SQ": "HARBOR SUPPORT GROUP"
     "orgParents": {},
     # org code → function where the default (by staff digit) is wrong for you: {"S36": "exercises"}
